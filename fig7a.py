@@ -6,6 +6,7 @@ import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
 from numba import njit
 
+
 # ============================================================
 # 1. Model parameters
 # ============================================================
@@ -16,11 +17,10 @@ EPSILON = 0.01
 ALPHA = 0.80
 BETA = 0.50
 
-# Finite-size test: all L curves are overlaid on one coordinate system.
-L_VALUES = (100, 200, 300, 400)
+# Finite-size test.
+L_VALUES = (50, 100, 200, 300)
 
-# Fine mutation-rate grid.
-# Set U_STEP=0.0005 for a finer mutation-rate grid if needed.
+# Mutation-rate grid.
 U_MIN = 0.000
 U_MAX = 0.040
 U_STEP = 0.001
@@ -29,14 +29,12 @@ U_STEP = 0.001
 B_LOW_INIT = 1.00
 B_HIGH_INIT = 1.70
 B_TOLERANCE = 0.001
-
 FC_THRESHOLD = 0.98
 
-# Paper-level statistics. For a quick test, reduce these three
-# values temporarily, but do not use the reduced values for the paper.
+# Paper-level statistics.
 MCS_MAX = 20000
 MCS_STABLE = 3000
-NUM_RUNS = 100
+NUM_RUNS = 50
 
 # Reproducible independent runs.
 BASE_SEED = 20261007
@@ -45,7 +43,6 @@ BASE_SEED = 20261007
 SHOW_PLOTS = False
 
 # Limit worker count to about 70% of logical CPU cores.
-# This is not an exact real-time CPU utilization limit.
 CPU_FRACTION = 0.70
 MAX_WORKERS = max(1, int((os.cpu_count() or 1) * CPU_FRACTION))
 
@@ -54,7 +51,7 @@ OUTPUT_DIR = Path(__file__).resolve().parent / "7a_results"
 
 
 # ============================================================
-# 2. Lattice and immediate-reputation dynamics
+# 2. Lattice and synchronous-reputation dynamics
 # ============================================================
 @njit
 def build_neighbor_map(L):
@@ -76,7 +73,7 @@ def build_neighbor_map(L):
 
 @njit
 def payoff(s_i, s_j, b):
-    """Weak prisoner's dilemma: [[1, 0], [b, 0]]."""
+    """Weak prisoner's dilemma payoff matrix [[1, 0], [b, 0]]."""
     if s_i == 1:
         return 1.0 if s_j == 1 else 0.0
     return b if s_j == 1 else 0.0
@@ -97,59 +94,53 @@ def run_simulation(
     seed,
 ):
     """
-    One independent realization.
+    One independent realization with synchronous reputation updates.
 
-    The reputation rule intentionally follows the requested setting:
-    after every microscopic strategy update, the selected player's
-    reputation is updated immediately. Other players' reputations remain
-    unchanged until they are selected.
+    At the beginning of each MCS, the reputation-weighted global
+    endorsements are calculated once and then held fixed during all
+    N microscopic strategy updates in that MCS. Strategies may change
+    asynchronously during the MCS, but reputations remain unchanged.
+    After the N microscopic updates, all reputations are updated
+    synchronously using the resulting strategy configuration.
     """
     np.random.seed(seed)
 
     N = L * L
     strategies = np.random.randint(0, 2, size=N)
     reputations = np.full(N, 0.5, dtype=np.float64)
-
-    # Reputation-weighted global strategy sums.
-    global_R_C = 0.0
-    global_R_D = 0.0
-    for q in range(N):
-        value = reputations[q] + epsilon
-        if strategies[q] == 1:
-            global_R_C += value
-        else:
-            global_R_D += value
-    global_R_total = global_R_C + global_R_D
-
     fc_history = np.empty(mcs_stable, dtype=np.float64)
 
     for step in range(mcs_max):
-        # Random selection with replacement: exactly N microscopic events
-        # per MCS, as in the original bcr-u.py.
+        # --------------------------------------------------------
+        # Global endorsement snapshot at the beginning of this MCS.
+        # This scan is performed once per MCS, rather than once per
+        # microscopic update.
+        # --------------------------------------------------------
+        global_R_C = 0.0
+        global_R_D = 0.0
+        for q in range(N):
+            value = reputations[q] + epsilon
+            if strategies[q] == 1:
+                global_R_C += value
+            else:
+                global_R_D += value
+        global_R_total = global_R_C + global_R_D
+
+        # Random selection with replacement: N microscopic events per MCS.
         for _ in range(N):
             i = np.random.randint(0, N)
 
-            # 1. Mutation/reset phase
+            # 1. Mutation/reset phase.
             if np.random.random() < u_current:
-                new_strategy = np.random.randint(0, 2)
+                # Random reset, rather than a forced strategy flip.
+                strategies[i] = np.random.randint(0, 2)
 
-                if new_strategy != strategies[i]:
-                    strategies[i] = new_strategy
-                    value = reputations[i] + epsilon
-
-                    if new_strategy == 1:
-                        global_R_C += value
-                        global_R_D -= value
-                    else:
-                        global_R_D += value
-                        global_R_C -= value
-
-            # 2. Fermi imitation phase
+            # 2. Fermi imitation phase.
             else:
                 j = neighbors[i, np.random.randint(0, 4)]
 
                 if strategies[i] != strategies[j]:
-                    # Fitness of focal player i
+                    # Fitness of focal player i.
                     payoff_i = 0.0
                     local_num_i = reputations[i] + epsilon
                     local_den_i = reputations[i] + epsilon
@@ -172,7 +163,7 @@ def run_simulation(
                     endorsement_i = alpha * local_i + (1.0 - alpha) * global_i
                     fitness_i = payoff_i * (max(endorsement_i, 1e-12) ** beta)
 
-                    # Fitness of target neighbor j
+                    # Fitness of target neighbor j.
                     payoff_j = 0.0
                     local_num_j = reputations[j] + epsilon
                     local_den_j = reputations[j] + epsilon
@@ -205,26 +196,16 @@ def run_simulation(
 
                     if np.random.random() < imitation_probability:
                         strategies[i] = strategies[j]
-                        value = reputations[i] + epsilon
 
-                        if strategies[i] == 1:
-                            global_R_C += value
-                            global_R_D -= value
-                        else:
-                            global_R_D += value
-                            global_R_C -= value
+            # No reputation update is performed here. Reputations remain
+            # fixed throughout the current MCS.
 
-            # 3. Immediate reputation update requested by the user
-            old_R = reputations[i]
-            new_R = (1.0 - gamma) * old_R + gamma * float(strategies[i])
-            reputations[i] = new_R
-
-            difference = new_R - old_R
-            global_R_total += difference
-            if strategies[i] == 1:
-                global_R_C += difference
-            else:
-                global_R_D += difference
+        # 3. Synchronous reputation update at the end of the MCS.
+        for i in range(N):
+            reputations[i] = (
+                (1.0 - gamma) * reputations[i]
+                + gamma * float(strategies[i])
+            )
 
         if step >= mcs_max - mcs_stable:
             fc_history[step - (mcs_max - mcs_stable)] = np.sum(strategies) / N
@@ -233,13 +214,10 @@ def run_simulation(
 
 
 # ============================================================
-# 3. Critical b search and reproducible averaging
+# 3. Critical-b search and reproducible averaging
 # ============================================================
 def make_seed(l_index, u_index, run_index):
-    """
-    The seed is independent of b so that all b evaluations at the same
-    (L, u, run) use common random numbers, reducing bisection noise.
-    """
+    """Generate a stable seed for each (L, u, independent-run) combination."""
     modulus = 2**32 - 1
     return int(
         (
@@ -252,7 +230,6 @@ def make_seed(l_index, u_index, run_index):
     )
 
 
-# Each worker keeps its own lattice and Numba random-number state.
 _WORKER_L = None
 _WORKER_NEIGHBORS = None
 
@@ -266,8 +243,16 @@ def initialize_worker(L):
 def run_one_worker(task):
     l_index, u_index, u_value, b_value, run_index = task
     return run_simulation(
-        _WORKER_L, u_value, b_value, ALPHA, BETA, GAMMA, EPSILON,
-        MCS_MAX, MCS_STABLE, _WORKER_NEIGHBORS,
+        _WORKER_L,
+        u_value,
+        b_value,
+        ALPHA,
+        BETA,
+        GAMMA,
+        EPSILON,
+        MCS_MAX,
+        MCS_STABLE,
+        _WORKER_NEIGHBORS,
         make_seed(l_index, u_index, run_index),
     )
 
@@ -277,17 +262,29 @@ def average_fc(L, l_index, u_index, u_value, b_value, neighbors, executor=None):
         (l_index, u_index, u_value, b_value, run_index)
         for run_index in range(NUM_RUNS)
     ]
+
     if executor is None:
         values = []
         for task in tasks:
             run_index = task[-1]
-            values.append(run_simulation(
-                L, u_value, b_value, ALPHA, BETA, GAMMA, EPSILON,
-                MCS_MAX, MCS_STABLE, neighbors,
-                make_seed(l_index, u_index, run_index),
-            ))
+            values.append(
+                run_simulation(
+                    L,
+                    u_value,
+                    b_value,
+                    ALPHA,
+                    BETA,
+                    GAMMA,
+                    EPSILON,
+                    MCS_MAX,
+                    MCS_STABLE,
+                    neighbors,
+                    make_seed(l_index, u_index, run_index),
+                )
+            )
     else:
         values = list(executor.map(run_one_worker, tasks))
+
     return float(np.mean(np.asarray(values, dtype=np.float64)))
 
 
@@ -295,27 +292,36 @@ def estimate_bcr(L, l_index, u_index, u_value, neighbors, executor=None):
     """Find the largest b for which mean(fc) >= FC_THRESHOLD."""
     b_low = B_LOW_INIT
     b_high = B_HIGH_INIT
-    fc_low = average_fc(L, l_index, u_index, u_value, b_low, neighbors, executor)
+
+    fc_low = average_fc(
+        L, l_index, u_index, u_value, b_low, neighbors, executor
+    )
     if fc_low < FC_THRESHOLD:
         return b_low
-    fc_high = average_fc(L, l_index, u_index, u_value, b_high, neighbors, executor)
+
+    fc_high = average_fc(
+        L, l_index, u_index, u_value, b_high, neighbors, executor
+    )
     if fc_high >= FC_THRESHOLD:
         return b_high
+
     while (b_high - b_low) > B_TOLERANCE:
         b_mid = 0.5 * (b_low + b_high)
-        fc_mid = average_fc(L, l_index, u_index, u_value, b_mid, neighbors, executor)
+        fc_mid = average_fc(
+            L, l_index, u_index, u_value, b_mid, neighbors, executor
+        )
         if fc_mid >= FC_THRESHOLD:
             b_low = b_mid
         else:
             b_high = b_mid
+
     return b_low
 
 
 # ============================================================
-# 4. Data and unchanged single-panel figure format
+# 4. Data and figure output
 # ============================================================
 def normalize_l_values(values):
-    """Allow either one lattice size (e.g. 100) or a sequence of sizes."""
     if np.isscalar(values):
         values = (int(values),)
     else:
@@ -332,21 +338,26 @@ def make_u_values():
 
 
 def save_data(L, u_values, bcr_results):
-    """Save the raw two-column data for one lattice size."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     data_name = OUTPUT_DIR / f"{ALPHA:.2f}bcr_vs_u_L{L}_data.txt"
     np.savetxt(
-        str(data_name), np.column_stack((u_values, bcr_results)),
-        fmt="%.6f", delimiter="\t", header="u\tbcr", comments="",
+        str(data_name),
+        np.column_stack((u_values, bcr_results)),
+        fmt="%.6f",
+        delimiter="\t",
+        header="u\tbcr",
+        comments="",
     )
     return data_name
 
 
 def save_combined_plot(lattice_values, u_values, results_by_L):
-    """Plot raw simulation results and save PNG/EPS with peak markers."""
     from matplotlib.ticker import MultipleLocator, FuncFormatter
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    fallback_colors = ["#00AEB8", "#2146CB", "#E69F00", "#D62728", "#7A3DB8"]
+    fallback_colors = [
+        "#00AEB8", "#2146CB", "#E69F00", "#D62728", "#7A3DB8"
+    ]
     plt.rcParams.update({
         "font.family": "serif",
         "font.serif": ["Times New Roman", "DejaVu Serif"],
@@ -360,48 +371,91 @@ def save_combined_plot(lattice_values, u_values, results_by_L):
         "ps.fonttype": 42,
     })
 
-    # 四条曲线统一使用 L=100 的格式，仅更换颜色。
-    # 不平滑、不移动、不改动原始数据；每个数据点显示一个 + 标记。
-    colors = {100: "#00AEB8", 200: "#2146CB",
-              300: "#E69F00", 400: "#D62728"}
-    line_style = dict(linestyle="-", linewidth=1.5, marker="+",
-                      markersize=6, markeredgewidth=1.2, markevery=1)
+    colors = {
+        50: "#7A3DB8",
+        100: "#00AEB8",
+        200: "#2146CB",
+        300: "#E69F00",
+        400: "#D62728",
+    }
+    line_style = dict(
+        linestyle="-",
+        linewidth=1.5,
+        marker="+",
+        markersize=6,
+        markeredgewidth=1.2,
+        markevery=1,
+    )
 
     fig, ax = plt.subplots(figsize=(7.2, 6.0), layout="constrained")
     for index, L in enumerate(lattice_values):
         u = np.asarray(u_values)
         bcr = np.asarray(results_by_L[L])
-        ax.plot(u, bcr, label=rf"$L={L}$", solid_capstyle="butt",
-                dash_capstyle="butt", color=colors.get(L, fallback_colors[index % len(fallback_colors)]), zorder=2 + index,
-                **line_style)
-        # 与原代码一致：原始曲线最高点用同色实心圆单独突出。
-        # 若有并列最大值，np.argmax 选择 u 最小的那个点。
+        color = colors.get(L, fallback_colors[index % len(fallback_colors)])
+
+        ax.plot(
+            u,
+            bcr,
+            label=rf"$L={L}$",
+            solid_capstyle="butt",
+            dash_capstyle="butt",
+            color=color,
+            zorder=2 + index,
+            **line_style,
+        )
+
         peak_index = int(np.argmax(bcr))
-        ax.scatter(u[peak_index], bcr[peak_index], color=colors.get(L, fallback_colors[index % len(fallback_colors)]),
-                   marker="o", s=45, linewidths=0, zorder=10 + index,
-                   label="_nolegend_")
-        print(f"L={L}: peak u={u[peak_index]:.6f}, bcr={bcr[peak_index]:.6f}")
+        ax.scatter(
+            u[peak_index],
+            bcr[peak_index],
+            color=color,
+            marker="o",
+            s=45,
+            linewidths=0,
+            zorder=10 + index,
+            label="_nolegend_",
+        )
+        print(
+            f"L={L}: peak u={u[peak_index]:.6f}, "
+            f"b_cr={bcr[peak_index]:.6f}"
+        )
 
     ax.set_xlabel(r"$u$", labelpad=8)
     ax.set_ylabel(r"$b_{cr}$", labelpad=10)
     ax.set_xlim(0.0, 0.040)
     ax.set_ylim(1.0, 1.70)
     ax.xaxis.set_major_locator(MultipleLocator(0.01))
-    ax.xaxis.set_major_formatter(FuncFormatter(lambda x, _: "0" if abs(x) < 1e-10 else f"{x:.2f}"))
+    ax.xaxis.set_major_formatter(
+        FuncFormatter(lambda x, _: "0" if abs(x) < 1e-10 else f"{x:.2f}")
+    )
     ax.yaxis.set_major_locator(MultipleLocator(0.1))
     ax.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f"{y:g}"))
-    ax.tick_params(which="both", direction="in", top=True, right=True,
-                   length=6, width=1.2)
+    ax.tick_params(
+        which="both",
+        direction="in",
+        top=True,
+        right=True,
+        length=6,
+        width=1.2,
+    )
     ax.grid(False)
-    legend = ax.legend(loc="upper right", fontsize=13, handlelength=2.8,
-                       frameon=True, framealpha=1, edgecolor="0.2",
-                       borderpad=0.4, labelspacing=0.3)
+    legend = ax.legend(
+        loc="upper right",
+        fontsize=13,
+        handlelength=2.8,
+        frameon=True,
+        framealpha=1,
+        edgecolor="0.2",
+        borderpad=0.4,
+        labelspacing=0.3,
+    )
     legend.get_frame().set_linewidth(1.0)
 
     for suffix in ("png", "eps"):
         path = OUTPUT_DIR / f"{ALPHA:.2f}bcr_vs_u_all_L_lines.{suffix}"
         fig.savefig(path, dpi=600, bbox_inches="tight", facecolor="white")
         print(f"Saved: {path}")
+
     if SHOW_PLOTS:
         plt.show()
     plt.close(fig)
@@ -415,24 +469,37 @@ def main():
         raise ValueError("Invalid mutation-rate grid.")
     if NUM_RUNS < 1:
         raise ValueError("NUM_RUNS must be at least 1.")
+
     lattice_values = normalize_l_values(L_VALUES)
     u_values = make_u_values()
     all_summary = []
     results_by_L = {}
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
     print(f"Output directory: {OUTPUT_DIR.resolve()}")
     print("Starting b_cr(u) calculations")
     print(f"alpha={ALPHA}, beta={BETA}, gamma={GAMMA}, K={K}")
     print(f"u grid: {len(u_values)} points, step={U_STEP}")
     print(f"L values: {lattice_values}")
-    print(f"MCS={MCS_MAX}, stable window={MCS_STABLE}, independent runs={NUM_RUNS}")
+    print(
+        f"MCS={MCS_MAX}, stable window={MCS_STABLE}, "
+        f"independent runs={NUM_RUNS}"
+    )
+    print(
+        "Reputation rule: global endorsement is fixed within each MCS; "
+        "reputation is updated synchronously at the MCS boundary."
+    )
+
     for l_index, L in enumerate(lattice_values):
-        N = L * L
         neighbors = build_neighbor_map(L)
         bcr_results = []
-        print(f"\nCalculating L={L} (N={N})")
-        print(f"Using {MAX_WORKERS}/{os.cpu_count() or 1} logical CPU cores "
-              f"(target fraction={CPU_FRACTION:.0%})")
+
+        print(f"\nCalculating L={L} (N={L * L})")
+        print(
+            f"Using {MAX_WORKERS}/{os.cpu_count() or 1} logical CPU cores "
+            f"(target fraction={CPU_FRACTION:.0%})"
+        )
+
         with ProcessPoolExecutor(
             max_workers=MAX_WORKERS,
             initializer=initialize_worker,
@@ -440,15 +507,23 @@ def main():
         ) as executor:
             for u_index, u_value in enumerate(u_values):
                 bcr = estimate_bcr(
-                    L, l_index, u_index, float(u_value), neighbors, executor,
+                    L,
+                    l_index,
+                    u_index,
+                    float(u_value),
+                    neighbors,
+                    executor,
                 )
                 bcr_results.append(bcr)
                 print(f"L={L}, u={u_value:.4f} -> b_cr={bcr:.4f}")
+
         bcr_results = np.asarray(bcr_results, dtype=np.float64)
         results_by_L[L] = bcr_results
         data_name = save_data(L, u_values, bcr_results)
+
         for u_value, bcr in zip(u_values, bcr_results):
             all_summary.append([L, u_value, bcr])
+
         optimal_u_index = int(np.argmax(bcr_results))
         print(f"Saved data: {Path(data_name).resolve()}")
         print(
@@ -456,15 +531,23 @@ def main():
             f"u*={u_values[optimal_u_index]:.4f}, "
             f"b_cr={bcr_results[optimal_u_index]:.4f}"
         )
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
     summary_name = OUTPUT_DIR / f"{ALPHA:.2f}bcr_vs_u_all_L_summary.txt"
     np.savetxt(
-        str(summary_name), np.asarray(all_summary),
-        fmt=["%d", "%.6f", "%.6f"], delimiter="\t",
-        header="L\tu\tbcr", comments="",
+        str(summary_name),
+        np.asarray(all_summary),
+        fmt=["%d", "%.6f", "%.6f"],
+        delimiter="\t",
+        header="L\tu\tbcr",
+        comments="",
     )
     print(f"Saved finite-size summary: {summary_name.resolve()}")
-    combined_figure = save_combined_plot(lattice_values, u_values, results_by_L)
+
+    combined_figure = save_combined_plot(
+        lattice_values,
+        u_values,
+        results_by_L,
+    )
     print(f"Saved combined figure: {Path(combined_figure).resolve()}")
 
 

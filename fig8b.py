@@ -1,3 +1,6 @@
+# Updating protocol fixed to the manuscript; historical results require recomputation.
+from model_rules import (mcs_fixed, mcs_csr, mcs_square, periodic_neighbors,
+                         PROTOCOL_ID, prepare_run_directory)
 
 import os
 
@@ -168,52 +171,9 @@ def calculate_fitness(node, b, alpha, beta, epsilon, global_C, global_D,
 
 
 @njit(cache=True)
-def simulation_step(population, noise_K, b, alpha, beta, gamma, epsilon, u,
-                    strategies, reputations, offsets, neighbors):
-    # 全局背书在每个MCS开始时计算一次快照。
-    total_reputation = np.sum(reputations) + population * epsilon
-    cooperator_reputation = 0.0
-    for i in range(population):
-        if strategies[i] == 1:
-            cooperator_reputation += reputations[i] + epsilon
-    global_C = cooperator_reputation / total_reputation
-    global_D = 1.0 - global_C
-
-    # 每个MCS将全部节点随机排列，每个节点恰好获得一次更新机会。
-    for i in np.random.permutation(population):
-        if np.random.random() < u:
-            strategies[i] = np.random.randint(0, 2)
-            continue
-
-        degree_i = offsets[i + 1] - offsets[i]
-        if degree_i == 0:
-            continue
-        j = neighbors[offsets[i] + np.random.randint(0, degree_i)]
-        if strategies[i] == strategies[j]:
-            continue
-
-        fitness_i = calculate_fitness(
-            i, b, alpha, beta, epsilon, global_C, global_D,
-            strategies, reputations, offsets, neighbors,
-        )
-        fitness_j = calculate_fitness(
-            j, b, alpha, beta, epsilon, global_C, global_D,
-            strategies, reputations, offsets, neighbors,
-        )
-        exponent = (fitness_i - fitness_j) / noise_K
-        # 保留原代码的指数截断规则。
-        if exponent > 20.0:
-            imitation_probability = 0.0
-        elif exponent < -20.0:
-            imitation_probability = 1.0
-        else:
-            imitation_probability = 1.0 / (1.0 + np.exp(exponent))
-        if np.random.random() < imitation_probability:
-            strategies[i] = strategies[j]
-
-    # 声誉只在MCS结束时同步更新；突变不直接重置声誉。
-    for i in range(population):
-        reputations[i] = (1.0 - gamma) * reputations[i] + gamma * float(strategies[i])
+def simulation_step(population, noise_K, b, alpha, beta, gamma, epsilon, u, strategies, reputations, offsets, neighbors):
+    mcs_csr(strategies, reputations, offsets, neighbors, noise_K, b,
+            alpha, beta, gamma, epsilon, u)
 
 
 @njit(cache=True)
@@ -444,7 +404,7 @@ def main():
     parser.add_argument('--workers', type=int, default=None,
                         help='覆盖进程数；默认使用约60%%逻辑核心。')
     parser.add_argument('--output-dir', type=Path,
-                        default=Path(__file__).resolve().parent / 'network_structure_results',
+                        default=Path(__file__).resolve().parent / 'network_structure_results_current_protocol',
                         help='输出根目录；每次运行创建独立时间戳子目录。')
     arguments = parser.parse_args()
     b_values = np.asarray(B_VALUES, dtype=np.float64)
@@ -493,7 +453,7 @@ def main():
         'all_N_nodes_retained; no_connectivity_conditioning; '
         'isolates_skip_imitation_only; fc_denominator=N\n'
         'payoff=accumulated_not_degree_normalized; local_endorsement=neighbors_plus_self; '
-        'update=random_permutation_each_MCS; global_endorsement=start_of_MCS_snapshot; '
+        'update=random_with_replacement_per_MCS; global_endorsement=current_configuration_incremental; '
         'reputation_update=synchronous_end_of_MCS\n'
         'initialization=fixed_count_round_half_up_with_random_positions\n'
         f'early_stop_absorbing={EARLY_STOP_ABSORBING} '
@@ -634,6 +594,7 @@ def main():
 
 
 if __name__ == '__main__':
+    prepare_run_directory(__file__, globals())
     mp.freeze_support()
     main()
 

@@ -1,3 +1,6 @@
+# Updating protocol fixed to the manuscript; historical results require recomputation.
+from model_rules import (mcs_fixed, mcs_csr, mcs_square, periodic_neighbors,
+                         PROTOCOL_ID, prepare_run_directory)
 """Compare initial cooperator fractions with the supplied spatial-game model.
 
 Run this file directly in PyCharm or with:
@@ -76,79 +79,9 @@ def calculate_payoff(strategy_i, strategy_j, b):
 
 
 @njit(cache=True)
-def simulation_step(population, noise_K, b, alpha, beta, gamma, epsilon, u,
-                    strategies, reputations, neighbor_map):
-    # Global reputation-weighted popularity is a snapshot at the start of MCS.
-    total_reputation = np.sum(reputations) + population * epsilon
-    cooperator_reputation = 0.0
-    for i in range(population):
-        if strategies[i] == 1:
-            cooperator_reputation += reputations[i] + epsilon
-
-    global_C = cooperator_reputation / total_reputation
-    global_D = 1.0 - global_C
-
-    # Preserve the source rule: each player is selected once in a random order per MCS.
-    for i in np.random.permutation(population):
-        # Mutation is a random reset; it is not a guaranteed strategy flip.
-        if np.random.random() < u:
-            strategies[i] = np.random.randint(0, 2)
-            continue
-
-        j = neighbor_map[i, np.random.randint(0, 4)]
-        if strategies[i] == strategies[j]:
-            continue
-
-        payoff_i = 0.0
-        numerator_i = reputations[i] + epsilon
-        denominator_i = reputations[i] + epsilon
-        for neighbor_index in range(4):
-            neighbor = neighbor_map[i, neighbor_index]
-            payoff_i += calculate_payoff(strategies[i], strategies[neighbor], b)
-            weight = reputations[neighbor] + epsilon
-            denominator_i += weight
-            if strategies[neighbor] == strategies[i]:
-                numerator_i += weight
-        local_i = numerator_i / denominator_i
-        total_i = alpha * local_i + (1.0 - alpha) * (
-            global_C if strategies[i] == 1 else global_D
-        )
-        if total_i < 1e-9:
-            total_i = 1e-9
-        fitness_i = payoff_i * (total_i ** beta)
-
-        payoff_j = 0.0
-        numerator_j = reputations[j] + epsilon
-        denominator_j = reputations[j] + epsilon
-        for neighbor_index in range(4):
-            neighbor = neighbor_map[j, neighbor_index]
-            payoff_j += calculate_payoff(strategies[j], strategies[neighbor], b)
-            weight = reputations[neighbor] + epsilon
-            denominator_j += weight
-            if strategies[neighbor] == strategies[j]:
-                numerator_j += weight
-        local_j = numerator_j / denominator_j
-        total_j = alpha * local_j + (1.0 - alpha) * (
-            global_C if strategies[j] == 1 else global_D
-        )
-        if total_j < 1e-9:
-            total_j = 1e-9
-        fitness_j = payoff_j * (total_j ** beta)
-
-        exponent = (fitness_i - fitness_j) / noise_K
-        if exponent > 20.0:
-            imitation_probability = 0.0
-        elif exponent < -20.0:
-            imitation_probability = 1.0
-        else:
-            imitation_probability = 1.0 / (1.0 + np.exp(exponent))
-        if np.random.random() < imitation_probability:
-            strategies[i] = strategies[j]
-
-    # Synchronous EMA reputation update at the end of MCS.
-    for i in range(population):
-        reputations[i] = (1.0 - gamma) * reputations[i] + gamma * float(strategies[i])
-    return strategies, reputations
+def simulation_step(population, noise_K, b, alpha, beta, gamma, epsilon, u, strategies, reputations, neighbor_map):
+    mcs_fixed(strategies, reputations, neighbor_map, noise_K, b,
+              alpha, beta, gamma, epsilon, u)
 
 
 @njit(cache=True)
@@ -298,7 +231,7 @@ def main():
     parser.add_argument('--workers', type=int, default=None,
                         help='Optional worker-count override; default uses about 60%% of logical cores.')
     parser.add_argument('--output-dir', type=Path,
-                        default=Path(__file__).resolve().parent / 'initial_condition_results')
+                        default=Path(__file__).resolve().parent / 'initial_condition_results_current_protocol')
     arguments = parser.parse_args()
 
     initial_values = np.asarray(INITIAL_FC_VALUES, dtype=np.float64)
@@ -371,8 +304,8 @@ def main():
         )
         + 'initialization=fixed_cooperator_count_random_positions; '
           'count=round_half_up(fc_initial_target*N); reputation_initial=0.5\n'
-        + 'periodic_boundary=True degree=4; update=random_permutation_per_MCS; '
-          'global_endorsement=start_of_MCS_snapshot; '
+        + 'periodic_boundary=True degree=4; update=random_with_replacement_per_MCS; '
+          'global_endorsement=current_configuration_incremental; '
           'reputation_update=synchronous_end_of_MCS\n'
         + 'fc_run=mean_over_sampling_MCS; fc_mean=mean_of_independent_run_means; '
           'fc_std=sample_std(ddof=1); fc_sem=fc_std/sqrt(NUM_RUNS)\n'
@@ -433,5 +366,6 @@ def main():
 
 
 if __name__ == '__main__':
+    prepare_run_directory(__file__, globals())
     mp.freeze_support()
     main()

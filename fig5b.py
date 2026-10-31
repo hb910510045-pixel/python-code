@@ -1,3 +1,6 @@
+# Updating protocol fixed to the manuscript; historical results require recomputation.
+from model_rules import (mcs_fixed, mcs_csr, mcs_square, periodic_neighbors,
+                         PROTOCOL_ID, prepare_run_directory)
 import numpy as np
 import matplotlib.pyplot as plt
 from numba import jit
@@ -57,82 +60,8 @@ def calculate_payoff(s_i, s_j, b):
 
 @jit(nopython=True)
 def simulation_step_optimized(N, K, b, alpha, beta, lam, epsilon, u, strategies, reputations, neighbor_map):
-    # --- [GPop 计算] 全局流行度 (在 MCS 开始时计算一次快照) ---
-    total_rep = np.sum(reputations) + N * epsilon
-    sum_c = 0.0
-    for i in range(N):
-        if strategies[i] == 1:
-            sum_c += reputations[i] + epsilon
-
-    gpop_C = sum_c / total_rep
-    gpop_D = 1.0 - gpop_C
-
-    # --- 策略更新 (MCS 循环) ---
-    indices = np.random.permutation(N)
-    for k in range(N):
-        i = indices[k]
-
-        # 1. 突变
-        if np.random.random() < u:
-            strategies[i] = np.random.randint(0, 2)
-
-        # 2. 选择与模仿
-        else:
-            j = neighbor_map[i, np.random.randint(0, 4)]
-
-            if strategies[i] != strategies[j]:
-                # --- 计算 F_i ---
-                p_i = 0.0
-                num_i, den_i = reputations[i] + epsilon, reputations[i] + epsilon
-
-                for idx in range(4):
-                    nb = neighbor_map[i, idx]
-                    p_i += calculate_payoff(strategies[i], strategies[nb], b)
-                    w = reputations[nb] + epsilon
-                    den_i += w
-                    if strategies[nb] == strategies[i]:
-                        num_i += w
-
-                lpop_i = num_i / den_i
-                tpop_i = alpha * lpop_i + (1.0 - alpha) * (gpop_C if strategies[i] == 1 else gpop_D)
-
-                if tpop_i < 1e-9: tpop_i = 1e-9
-                fit_i = p_i * (tpop_i ** beta)
-
-                # --- 计算 F_j ---
-                p_j = 0.0
-                num_j, den_j = reputations[j] + epsilon, reputations[j] + epsilon
-
-                for idx in range(4):
-                    nb = neighbor_map[j, idx]
-                    p_j += calculate_payoff(strategies[j], strategies[nb], b)
-                    w = reputations[nb] + epsilon
-                    den_j += w
-                    if strategies[nb] == strategies[j]:
-                        num_j += w
-
-                lpop_j = num_j / den_j
-                tpop_j = alpha * lpop_j + (1.0 - alpha) * (gpop_C if strategies[j] == 1 else gpop_D)
-
-                if tpop_j < 1e-9: tpop_j = 1e-9
-                fit_j = p_j * (tpop_j ** beta)
-
-                # --- 费米规则 ---
-                exp_val = (fit_i - fit_j) / K
-                if exp_val > 20:
-                    prob = 0.0
-                elif exp_val < -20:
-                    prob = 1.0
-                else:
-                    prob = 1.0 / (1.0 + np.exp(exp_val))
-
-                if np.random.random() < prob:
-                    strategies[i] = strategies[j]
-
-    # --- 声誉更新 ---
-    for i in range(N):
-        reputations[i] = (1.0 - lam) * reputations[i] + lam * float(strategies[i])
-
+    mcs_fixed(strategies, reputations, neighbor_map, K, b,
+              alpha, beta, lam, epsilon, u)
     return strategies, reputations
 
 
@@ -157,6 +86,7 @@ def run_single_experiment(b, alpha, beta, neighbor_map):
 # ==========================================
 
 if __name__ == "__main__":
+    prepare_run_directory(__file__, globals())
     neighbor_map = build_neighbor_map(L)
     export_list = []
     plot_data = {}

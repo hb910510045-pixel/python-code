@@ -1,3 +1,6 @@
+# Updating protocol fixed to the manuscript; historical results require recomputation.
+from model_rules import (mcs_fixed, mcs_csr, mcs_square, periodic_neighbors,
+                         PROTOCOL_ID, prepare_run_directory)
 import os
 
 # 在导入数值库前设置；Windows spawn子进程也会执行，防止线程过度叠加。
@@ -151,45 +154,9 @@ def calculate_fitness(node, reward, sucker, temptation, punishment, alpha, beta,
 
 
 @njit(cache=True)
-def simulation_step(reward, sucker, temptation, punishment, noise_K, alpha, beta,
-                    gamma, epsilon, u, strategies, reputations, neighbors):
-    population = len(strategies)
-    total_reputation = np.sum(reputations) + population * epsilon
-    cooperator_reputation = 0.0
-    for i in range(population):
-        if strategies[i] == 1:
-            cooperator_reputation += reputations[i] + epsilon
-    global_C = cooperator_reputation / total_reputation
-
-    # 延续所给Python的每MCS随机排列更新规则。
-    for i in np.random.permutation(population):
-        if np.random.random() < u:
-            strategies[i] = np.random.randint(0, 2)
-            continue
-        j = neighbors[i, np.random.randint(0, 4)]
-        if strategies[i] == strategies[j]:
-            continue
-        fitness_i = calculate_fitness(
-            i, reward, sucker, temptation, punishment, alpha, beta, epsilon,
-            global_C, strategies, reputations, neighbors,
-        )
-        fitness_j = calculate_fitness(
-            j, reward, sucker, temptation, punishment, alpha, beta, epsilon,
-            global_C, strategies, reputations, neighbors,
-        )
-        exponent = (fitness_i - fitness_j) / noise_K
-        # 与所给代码一致的Fermi指数截断。
-        if exponent > 20.0:
-            probability = 0.0
-        elif exponent < -20.0:
-            probability = 1.0
-        else:
-            probability = 1.0 / (1.0 + np.exp(exponent))
-        if np.random.random() < probability:
-            strategies[i] = strategies[j]
-
-    for i in range(population):
-        reputations[i] = (1.0 - gamma) * reputations[i] + gamma * float(strategies[i])
+def simulation_step(reward, sucker, temptation, punishment, noise_K, alpha, beta, gamma, epsilon, u, strategies, reputations, neighbors):
+    mcs_fixed(strategies, reputations, neighbors, noise_K, temptation,
+              alpha, beta, gamma, epsilon, u, reward, sucker, punishment)
 
 
 @njit(cache=True)
@@ -351,7 +318,7 @@ def main():
     parser.add_argument('--workers', type=int, default=None,
                         help='覆盖worker数；默认约60%%逻辑核心。')
     parser.add_argument('--output-dir', type=Path,
-                        default=Path(__file__).resolve().parent / 'game_class_results')
+                        default=Path(__file__).resolve().parent / 'game_class_results_current_protocol')
     arguments = parser.parse_args()
     b_values = np.asarray(B_VALUES, dtype=np.float64)
     valid = validate_and_select_points(b_values)
@@ -390,7 +357,7 @@ def main():
         'invalid_class_points_are_not_simulated\n'
         'fitness=accumulated_payoff*endorsement**beta; '
         'negative_payoffs_and_fitness_retained; payoff_shift=0; payoff_clipping=False\n'
-        'update=random_permutation_per_MCS; global_endorsement=start_of_MCS_snapshot; '
+        'update=random_with_replacement_per_MCS; global_endorsement=current_configuration_incremental; '
         'local_endorsement=neighbors_plus_self; reputation_update=synchronous_end_of_MCS\n'
         'initialization=fixed_cooperator_count_round_half_up_random_positions; '
         'mutation=random_strategy_reset_without_reputation_reset\n'
@@ -452,6 +419,7 @@ def main():
 
 
 if __name__ == '__main__':
+    prepare_run_directory(__file__, globals())
     mp.freeze_support()
     main()
 

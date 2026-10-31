@@ -1,3 +1,6 @@
+# Updating protocol fixed to the manuscript; historical results require recomputation.
+from model_rules import (mcs_fixed, mcs_csr, mcs_square, periodic_neighbors,
+                         PROTOCOL_ID, prepare_run_directory)
 # -*- coding: utf-8 -*-
 """Figure 6 with pointwise 95% percentile-bootstrap confidence intervals.
 
@@ -79,82 +82,8 @@ def calculate_payoff(s_i, s_j, b):
 
 @njit(cache=True)
 def simulation_step_optimized(N, K, b, alpha, beta, gamma, epsilon, u, strategies, reputations, neighbor_map):
-    # --- [GPop 计算] 全局流行度 (在 MCS 开始时计算一次快照) ---
-    total_rep = np.sum(reputations) + N * epsilon
-    sum_c = 0.0
-    for i in range(N):
-        if strategies[i] == 1:
-            sum_c += reputations[i] + epsilon
-
-    gpop_C = sum_c / total_rep
-    gpop_D = 1.0 - gpop_C
-
-    # --- 策略更新 (MCS 循环) ---
-    indices = np.random.permutation(N)
-    for k in range(N):
-        i = indices[k]
-
-        # 1. 突变
-        if np.random.random() < u:
-            strategies[i] = np.random.randint(0, 2)
-
-        # 2. 选择与模仿
-        else:
-            j = neighbor_map[i, np.random.randint(0, 4)]
-
-            if strategies[i] != strategies[j]:
-                # --- 计算 F_i ---
-                p_i = 0.0
-                num_i, den_i = reputations[i] + epsilon, reputations[i] + epsilon
-
-                for idx in range(4):
-                    nb = neighbor_map[i, idx]
-                    p_i += calculate_payoff(strategies[i], strategies[nb], b)
-                    w = reputations[nb] + epsilon
-                    den_i += w
-                    if strategies[nb] == strategies[i]:
-                        num_i += w
-
-                lpop_i = num_i / den_i
-                tpop_i = alpha * lpop_i + (1.0 - alpha) * (gpop_C if strategies[i] == 1 else gpop_D)
-
-                if tpop_i < 1e-9: tpop_i = 1e-9
-                fit_i = p_i * (tpop_i ** beta)
-
-                # --- 计算 F_j ---
-                p_j = 0.0
-                num_j, den_j = reputations[j] + epsilon, reputations[j] + epsilon
-
-                for idx in range(4):
-                    nb = neighbor_map[j, idx]
-                    p_j += calculate_payoff(strategies[j], strategies[nb], b)
-                    w = reputations[nb] + epsilon
-                    den_j += w
-                    if strategies[nb] == strategies[j]:
-                        num_j += w
-
-                lpop_j = num_j / den_j
-                tpop_j = alpha * lpop_j + (1.0 - alpha) * (gpop_C if strategies[j] == 1 else gpop_D)
-
-                if tpop_j < 1e-9: tpop_j = 1e-9
-                fit_j = p_j * (tpop_j ** beta)
-
-                # --- 费米规则 ---
-                exp_val = (fit_i - fit_j) / K
-                if exp_val > 20:
-                    prob = 0.0
-                elif exp_val < -20:
-                    prob = 1.0
-                else:
-                    prob = 1.0 / (1.0 + np.exp(exp_val))
-
-                if np.random.random() < prob:
-                    strategies[i] = strategies[j]
-
-    # --- 声誉更新 ---
-    for i in range(N):
-        reputations[i] = (1.0 - gamma) * reputations[i] + gamma * float(strategies[i])
-
+    mcs_fixed(strategies, reputations, neighbor_map, K, b,
+              alpha, beta, gamma, epsilon, u)
     return strategies, reputations
 
 
@@ -204,7 +133,7 @@ CONFIDENCE_LEVEL = 0.95
 BOOTSTRAP_RESAMPLES = 10000
 BOOTSTRAP_BATCH = 500
 BOOTSTRAP_SEED_NAMESPACE = 610061
-OUTPUT_ROOT = Path(__file__).resolve().parent / "figure6_uncertainty_results"
+OUTPUT_ROOT = Path(__file__).resolve().parent / "figure6_uncertainty_results_current_protocol"
 
 _WORKER_CONFIG = None
 _WORKER_NEIGHBORS = None
@@ -213,6 +142,7 @@ _WORKER_NEIGHBORS = None
 def default_config():
     """Production settings: identical to the supplied simulation."""
     return {
+        "MODEL_PROTOCOL": PROTOCOL_ID,
         "L": int(L), "K": float(K), "EPSILON": float(EPSILON),
         "MCS_TOTAL": int(MCS_TOTAL), "MCS_TRANSIENT": int(MCS_TRANSIENT),
         "NUM_RUNS": int(NUM_RUNS), "FIXED_ALPHA": float(FIXED_ALPHA),
@@ -300,6 +230,8 @@ def load_raw(path):
         run_values = data["run_values"].copy()
         seeds = data["seeds"].copy()
         config = json.loads(data["config_json"].item())
+    if config.get("MODEL_PROTOCOL") != PROTOCOL_ID:
+        raise ValueError("Input data use an old or undocumented updating protocol; rerun simulations with this version.")
     return run_values, seeds, config
 
 
@@ -451,9 +383,9 @@ def export_results(run_values, seeds, config, stats, output_dir,
         "intervals_are_simultaneous": False,
         "normality_assumption_for_run_averages": False,
         "all_identical_parameter_points": int(np.count_nonzero(stats["identical_runs"])),
-        "unchanged_dynamics": [
-            "random permutation: each player is selected once per MCS",
-            "global endorsement is a snapshot at the beginning of each MCS",
+        "updating_protocol": [
+            "independent uniform focal sampling with replacement: N events per MCS",
+            "global endorsement follows current strategies after each strategy change",
             "asynchronous imitation within each MCS",
             "synchronous reputation update at the end of each MCS",
             "original absorbing-configuration early return applies only when u=0",
@@ -540,7 +472,7 @@ def plot_figure(config, stats, output_dir, show=False):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Figure 6: unchanged simulations with confidence intervals across independent runs.",
+        description="Figure 6: current-state replacement-sampling simulations with confidence intervals across independent runs.",
     )
     parser.add_argument("--plot-only", type=Path, help="Replot an existing figure6_raw_runs.npz without simulations.")
     parser.add_argument("--output-dir", type=Path, help="Explicit directory for this run's outputs.")
@@ -566,5 +498,6 @@ def main():
 
 
 if __name__ == "__main__":
+    prepare_run_directory(__file__, globals())
     mp.freeze_support()
     main()

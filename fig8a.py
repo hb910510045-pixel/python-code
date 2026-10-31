@@ -1,3 +1,6 @@
+# Updating protocol fixed to the manuscript; historical results require recomputation.
+from model_rules import (mcs_fixed, mcs_csr, mcs_square, periodic_neighbors,
+                         PROTOCOL_ID, prepare_run_directory)
 import argparse
 from pathlib import Path
 
@@ -28,7 +31,7 @@ PNG_DPI = 600
 
 # ==========================================================
 # 2. 原模型的更新规则
-#    保留周期边界、每 MCS 随机排列节点、全局背书的 MCS 开始快照、
+#    周期边界、每MCS有放回选择N次、全局背书随当前策略增量更新、
 #    MCS 末尾同步更新声誉，以及随机重置而非强制策略翻转。
 # ==========================================================
 @njit(cache=True)
@@ -54,78 +57,9 @@ def calculate_payoff(s_i, s_j, b):
 
 
 @njit(cache=True)
-def simulation_step_optimized(N, K, b, alpha, beta, gamma, epsilon, u,
-                              strategies, reputations, neighbor_map):
-    total_rep = np.sum(reputations) + N * epsilon
-    sum_c = 0.0
-    for i in range(N):
-        if strategies[i] == 1:
-            sum_c += reputations[i] + epsilon
-
-    gpop_C = sum_c / total_rep
-    gpop_D = 1.0 - gpop_C
-
-    indices = np.random.permutation(N)
-    for k in range(N):
-        i = indices[k]
-
-        # 突变：随机重置为 C 或 D，也可能保留原策略。
-        if np.random.random() < u:
-            strategies[i] = np.random.randint(0, 2)
-        else:
-            j = neighbor_map[i, np.random.randint(0, 4)]
-            if strategies[i] != strategies[j]:
-                p_i = 0.0
-                num_i = reputations[i] + epsilon
-                den_i = reputations[i] + epsilon
-                for idx in range(4):
-                    nb = neighbor_map[i, idx]
-                    p_i += calculate_payoff(strategies[i], strategies[nb], b)
-                    w = reputations[nb] + epsilon
-                    den_i += w
-                    if strategies[nb] == strategies[i]:
-                        num_i += w
-
-                lpop_i = num_i / den_i
-                tpop_i = alpha * lpop_i + (1.0 - alpha) * (
-                    gpop_C if strategies[i] == 1 else gpop_D
-                )
-                if tpop_i < 1e-9:
-                    tpop_i = 1e-9
-                fit_i = p_i * (tpop_i ** beta)
-
-                p_j = 0.0
-                num_j = reputations[j] + epsilon
-                den_j = reputations[j] + epsilon
-                for idx in range(4):
-                    nb = neighbor_map[j, idx]
-                    p_j += calculate_payoff(strategies[j], strategies[nb], b)
-                    w = reputations[nb] + epsilon
-                    den_j += w
-                    if strategies[nb] == strategies[j]:
-                        num_j += w
-
-                lpop_j = num_j / den_j
-                tpop_j = alpha * lpop_j + (1.0 - alpha) * (
-                    gpop_C if strategies[j] == 1 else gpop_D
-                )
-                if tpop_j < 1e-9:
-                    tpop_j = 1e-9
-                fit_j = p_j * (tpop_j ** beta)
-
-                exp_val = (fit_i - fit_j) / K
-                if exp_val > 20:
-                    prob = 0.0
-                elif exp_val < -20:
-                    prob = 1.0
-                else:
-                    prob = 1.0 / (1.0 + np.exp(exp_val))
-
-                if np.random.random() < prob:
-                    strategies[i] = strategies[j]
-
-    for i in range(N):
-        reputations[i] = (1.0 - gamma) * reputations[i] + gamma * float(strategies[i])
+def simulation_step_optimized(N, K, b, alpha, beta, gamma, epsilon, u, strategies, reputations, neighbor_map):
+    mcs_fixed(strategies, reputations, neighbor_map, K, b,
+              alpha, beta, gamma, epsilon, u)
     return strategies, reputations
 
 
@@ -221,7 +155,7 @@ def main():
                         help='Use a short test configuration, not manuscript results.')
     parser.add_argument('--no-show', action='store_true', help='Save figures without a window.')
     parser.add_argument('--output-dir', type=Path,
-                        default=Path(__file__).resolve().parent / 'population_size_results')
+                        default=Path(__file__).resolve().parent / 'population_size_results_current_protocol')
     args = parser.parse_args()
 
     if args.smoke_test:
@@ -263,7 +197,7 @@ def main():
             + 'initialization=independent_Bernoulli(p_C={}); reputation_initial=0.5\n'.format(
         INITIAL_C_PROBABILITY
     )
-            + 'update=random_permutation_per_MCS; global_endorsement=start_of_MCS_snapshot; '
+            + 'update=random_with_replacement_per_MCS; global_endorsement=current_configuration_incremental; '
               'reputation_update=synchronous_end_of_MCS\n'
             + 'fc_run=mean_over_sampling_MCS; fc_mean=mean_of_independent_run_means; '
               'fc_std=sample_std_of_run_means(ddof=1); fc_sem=fc_std/sqrt(NUM_RUNS)\n'
@@ -329,4 +263,5 @@ def main():
 
 
 if __name__ == '__main__':
+    prepare_run_directory(__file__, globals())
     main()

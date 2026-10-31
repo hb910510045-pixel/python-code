@@ -1,3 +1,4 @@
+# Updating protocol fixed to the manuscript; historical results require recomputation.
 import csv
 import datetime as dt
 import json
@@ -10,7 +11,8 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-from numba import jit
+from numba import jit, njit
+from scipy.stats import t as student_t
 from tqdm import tqdm
 
 
@@ -22,12 +24,11 @@ N = L * L
 K = 0.1
 FIXED_B = 1.11
 
-# The manuscript uses a total duration of 20000 MCS.
-# The final snapshot at 20000 MCS is retained explicitly below.
-MCS_TOTAL = 20000
-MCS_TRANSIENT = 17000
+# Current user-selected run length. The paper-scale setting is 20000 MCS.
+MCS_TOTAL = 2000
+MCS_TRANSIENT = 1700
 INIT_COOP_RATE = 0.5
-NUM_RUNS = 100
+NUM_RUNS = 50
 
 LAMBDA_VAL = 0.1
 MUTATION_RATE = 0.05
@@ -38,7 +39,18 @@ ALPHA_VALUES = [0.00, 0.50, 0.80, 1.00]
 
 # Reproducibility and resource control.
 BASE_SEED = 20261007
-CPU_FRACTION = 0.70
+CPU_FRACTION = 0.80
+
+# Optional short execution test; applied in Windows spawn children as well.
+SMOKE_TEST = "--smoke-test" in sys.argv[1:]
+if SMOKE_TEST:
+    L = 8
+    N = L * L
+    MCS_TOTAL = 40
+    MCS_TRANSIENT = 30
+    NUM_RUNS = 3
+    CPU_FRACTION = 1.0 / (os.cpu_count() or 1)
+    REQUESTED_CONVERGENCE_WINDOW = 10
 
 # Convergence diagnostics compare two adjacent windows at the end.
 REQUESTED_CONVERGENCE_WINDOW = 3000
@@ -54,7 +66,7 @@ SNAPSHOT_TIMES = tuple(sorted(set(
     [t for t in REQUESTED_SNAPSHOT_TIMES if 1 <= t <= MCS_TOTAL] + [MCS_TOTAL]
 )))
 N_BOOTSTRAP = 2000
-T_CRIT_95 = 1.984216951
+# Student-t critical values are computed from each condition's actual count.
 
 WORKER_NEIGHBOR_MAP = None
 
@@ -88,92 +100,128 @@ def seed_numba(seed):
     np.random.seed(seed)
 
 
-@jit(nopython=True)
-def single_mcs_step(n, k, b, alpha, beta, lam, epsilon, u,
-                    strategies, reputations, neighbor_map):
-    """
-    Advance one MCS.
+# Complete simulation kernel: no model_rules.py dependency.
+PROTOCOL_ID = 'replacement_current_global_end_mcs_ema_v1'
 
-    The global endorsement is evaluated once at the beginning of the
-    MCS and held fixed during its N microscopic updates.  This avoids
-    an O(N) global scan at every microscopic update while preserving
-    the snapshot convention used by this implementation.  Local
-    endorsement is evaluated only when a strategy pair is compared.
-    """
-    total_rep = np.sum(reputations) + n * epsilon
-    sum_c_rep = 0.0
-    for p in range(n):
-        if strategies[p] == 1:
-            sum_c_rep += reputations[p] + epsilon
+@njit
+def current_weights(strategies, reputations, epsilon):
+    total, cooperative = 0.0, 0.0
+    for x in range(len(strategies)):
+        weight = reputations[x] + epsilon
+        total += weight
+        if strategies[x] == 1:
+            cooperative += weight
+    return total, cooperative
 
-    gpop_c = sum_c_rep / total_rep
-    gpop_d = 1.0 - gpop_c
 
-    # One random permutation gives one update opportunity per player.
-    indices = np.random.permutation(n)
-    for i in indices:
-        if np.random.random() < u:
-            # Random reset, rather than a forced strategy flip.
-            strategies[i] = np.random.randint(0, 2)
-            continue
 
-        j = neighbor_map[i, np.random.randint(0, 4)]
-        if strategies[i] == strategies[j]:
-            continue
+@njit
+def fermi_probability(focal_fitness, neighbor_fitness, noise):
+    # Stable logistic: no hard truncation of finite probabilities.
+    exponent = (focal_fitness - neighbor_fitness) / noise
+    if exponent >= 0.0:
+        value = np.exp(-exponent)
+        return value / (1.0 + value)
+    return 1.0 / (1.0 + np.exp(exponent))
 
-        si = strategies[i]
-        ri = reputations[i]
-        pi = 0.0
-        local_num_i = ri + epsilon
-        local_den_i = ri + epsilon
-        for idx in range(4):
-            nb = neighbor_map[i, idx]
-            pi += calculate_payoff(si, strategies[nb], b)
-            w = reputations[nb] + epsilon
-            local_den_i += w
-            if strategies[nb] == si:
-                local_num_i += w
 
-        local_i = local_num_i / local_den_i
-        endorsement_i = alpha * local_i + (1.0 - alpha) * (
-            gpop_c if si == 1 else gpop_d
-        )
-        fit_i = pi * (max(endorsement_i, 1e-9) ** beta)
 
-        sj = strategies[j]
-        rj = reputations[j]
-        pj = 0.0
-        local_num_j = rj + epsilon
-        local_den_j = rj + epsilon
-        for idx in range(4):
-            nb = neighbor_map[j, idx]
-            pj += calculate_payoff(sj, strategies[nb], b)
-            w = reputations[nb] + epsilon
-            local_den_j += w
-            if strategies[nb] == sj:
-                local_num_j += w
-
-        local_j = local_num_j / local_den_j
-        endorsement_j = alpha * local_j + (1.0 - alpha) * (
-            gpop_c if sj == 1 else gpop_d
-        )
-        fit_j = pj * (max(endorsement_j, 1e-9) ** beta)
-
-        exponent = (fit_i - fit_j) / k
-        if exponent > 20.0:
-            imitation_probability = 0.0
-        elif exponent < -20.0:
-            imitation_probability = 1.0
+@njit
+def fixed_fitness(x, strategies, reputations, neighbors, total, cooperative,
+                  alpha, beta, epsilon, reward, sucker, temptation, punishment):
+    strategy = strategies[x]
+    numerator = reputations[x] + epsilon
+    denominator = numerator
+    payoff = 0.0
+    for edge in range(neighbors.shape[1]):
+        y = neighbors[x, edge]
+        weight = reputations[y] + epsilon
+        denominator += weight
+        if strategies[y] == strategy:
+            numerator += weight
+        if strategy == 1:
+            payoff += reward if strategies[y] == 1 else sucker
         else:
-            imitation_probability = 1.0 / (1.0 + np.exp(exponent))
+            payoff += temptation if strategies[y] == 1 else punishment
+    if beta == 0.0:
+        return payoff
+    # Only remove roundoff outside [0,1], not genuine small support.
+    global_c = min(1.0, max(0.0, cooperative / total))
+    support = alpha * numerator / denominator + (1.0 - alpha) * (
+        global_c if strategy == 1 else 1.0 - global_c)
+    return payoff * support ** beta
 
-        if np.random.random() < imitation_probability:
-            strategies[i] = strategies[j]
 
-    # Reputation is updated synchronously after all N strategy updates.
-    for i in range(n):
-        reputations[i] = (1.0 - lam) * reputations[i] + lam * float(strategies[i])
 
+@njit
+def fixed_event(x, strategies, reputations, neighbors, total, cooperative,
+                noise, alpha, beta, epsilon, u, reward, sucker, temptation, punishment):
+    old = strategies[x]
+    new = old
+    if np.random.random() < u:
+        new = np.random.randint(0, 2)
+    else:
+        y = neighbors[x, np.random.randint(0, neighbors.shape[1])]
+        if old != strategies[y]:
+            focal = fixed_fitness(x, strategies, reputations, neighbors, total,
+                                  cooperative, alpha, beta, epsilon,
+                                  reward, sucker, temptation, punishment)
+            target = fixed_fitness(y, strategies, reputations, neighbors, total,
+                                   cooperative, alpha, beta, epsilon,
+                                   reward, sucker, temptation, punishment)
+            if np.random.random() < fermi_probability(focal, target, noise):
+                new = strategies[y]
+    if new != old:
+        strategies[x] = new
+        cooperative += (reputations[x] + epsilon) * (new - old)
+    return cooperative
+
+
+
+@njit
+def mcs_fixed(strategies, reputations, neighbors, noise, b, alpha, beta,
+              gamma, epsilon, u, reward=1.0, sucker=0.0, punishment=0.0):
+    total, cooperative = current_weights(strategies, reputations, epsilon)
+    for _ in range(len(strategies)):
+        x = np.random.randint(0, len(strategies))
+        cooperative = fixed_event(x, strategies, reputations, neighbors,
+                                  total, cooperative, noise, alpha, beta,
+                                  epsilon, u, reward, sucker, b, punishment)
+    for x in range(len(strategies)):
+        reputations[x] = (1.0 - gamma) * reputations[x] + gamma * strategies[x]
+
+
+
+def prepare_run_directory(script_path, parameters=None):
+    """Keep new relative outputs separate from all historical result files."""
+    from pathlib import Path
+    from datetime import datetime
+    import os, json, hashlib, platform, sys
+    import numba
+    script = Path(script_path).resolve()
+    root = script.parent / ('results_' + PROTOCOL_ID)
+    output = root / ('run_' + datetime.now().strftime('%Y%m%d_%H%M%S_%f'))
+    output.mkdir(parents=True, exist_ok=False)
+    manifest = dict(protocol=PROTOCOL_ID, source=str(script), arguments=sys.argv[1:],
+                    source_sha256=hashlib.sha256(script.read_bytes()).hexdigest(),
+                    core_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                    python=platform.python_version(), numpy=np.__version__, numba=numba.__version__)
+    if parameters is not None:
+        captured = {}
+        for name, value in parameters.items():
+            if name.isupper() and isinstance(value, (str, int, float, bool, list, tuple, Path, np.ndarray)):
+                captured[name] = value.tolist() if isinstance(value, np.ndarray) else str(value) if isinstance(value, Path) else value
+        manifest['script_defaults'] = captured
+    (output / 'protocol_manifest.json').write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+    os.chdir(output)
+    return output
+
+
+@jit(nopython=True)
+def single_mcs_step(n, k, b, alpha, beta, lam, epsilon, u, strategies, reputations, neighbor_map):
+    mcs_fixed(strategies, reputations, neighbor_map, k, b,
+              alpha, beta, lam, epsilon, u)
     return strategies, reputations
 
 
@@ -194,11 +242,12 @@ def initialize_worker(l_size):
     WORKER_NEIGHBOR_MAP = build_neighbor_map(l_size)
 
     # Compile the Numba kernels in each worker before timed tasks begin.
-    dummy_s = np.ones(N, dtype=np.int64)
-    dummy_r = np.full(N, 0.5, dtype=np.float64)
+    population = l_size * l_size
+    dummy_s = np.ones(population, dtype=np.int64)
+    dummy_r = np.full(population, 0.5, dtype=np.float64)
     seed_numba(13579)
     single_mcs_step(
-        N, K, FIXED_B, 0.5, 0.5, LAMBDA_VAL, EPSILON,
+        population, K, FIXED_B, 0.5, 0.5, LAMBDA_VAL, EPSILON,
         MUTATION_RATE, dummy_s, dummy_r, WORKER_NEIGHBOR_MAP
     )
 
@@ -212,11 +261,8 @@ def run_single_simulation(task):
     np.random.seed(seed)
     seed_numba(seed)
 
-    # Exact initial composition: exactly INIT_COOP_RATE of players cooperate.
-    n_initial_cooperators = int(round(N * INIT_COOP_RATE))
-    strategies = np.zeros(N, dtype=np.int64)
-    strategies[:n_initial_cooperators] = 1
-    np.random.shuffle(strategies)
+    # Independent Bernoulli initialization, not a fixed cooperator count.
+    strategies = (np.random.random(N) < INIT_COOP_RATE).astype(np.int64)
     reputations = np.full(N, 0.5, dtype=np.float64)
     trajectory = np.empty(MCS_TOTAL + 1, dtype=np.float64)
     trajectory[0] = np.mean(strategies)
@@ -283,8 +329,9 @@ def finalize_condition_statistics(condition_stats):
         else:
             std = np.zeros_like(mean)
 
-        ci_low = mean - T_CRIT_95 * std / np.sqrt(max(n, 1))
-        ci_high = mean + T_CRIT_95 * std / np.sqrt(max(n, 1))
+        critical = float(student_t.ppf(0.975, n - 1)) if n > 1 else 0.0
+        ci_low = mean - critical * std / np.sqrt(max(n, 1))
+        ci_high = mean + critical * std / np.sqrt(max(n, 1))
         ci_low = np.clip(ci_low, 0.0, 1.0)
         ci_high = np.clip(ci_high, 0.0, 1.0)
 
@@ -331,6 +378,9 @@ def save_outputs(output_dir, condition_stats, finalized, runtime_report,
             "MCS_TOTAL": MCS_TOTAL,
             "MCS_TRANSIENT": MCS_TRANSIENT,
             "INIT_COOP_RATE": INIT_COOP_RATE,
+            "initialization": "independent_Bernoulli",
+            "strategy_sampling": "uniform_with_replacement",
+            "model_protocol": PROTOCOL_ID,
             "NUM_RUNS": NUM_RUNS,
             "LAMBDA_VAL": LAMBDA_VAL,
             "MUTATION_RATE": MUTATION_RATE,
@@ -343,7 +393,7 @@ def save_outputs(output_dir, condition_stats, finalized, runtime_report,
             "CONVERGENCE_TOL": CONVERGENCE_TOL,
             "SNAPSHOT_TIMES": SNAPSHOT_TIMES,
             "N_BOOTSTRAP": N_BOOTSTRAP,
-            "global_endorsement_update": "once_per_MCS_at_MCS_start",
+            "global_endorsement_update": "incremental_after_each_strategy_change",
             "reputation_update": "synchronous_at_MCS_end",
         }, handle, indent=2)
 
@@ -467,11 +517,18 @@ def plot_results(finalized, output_dir):
         ax.text(0.96, 0.08, rf"$\beta = {beta:.3f}$",
                 transform=ax.transAxes, fontsize=14, fontstyle="italic",
                 ha="right", va="bottom")
-        if panel == 0:
-            legend = ax.legend(loc="upper right", frameon=True,
-                               fontsize=12, labelspacing=0.2)
-            legend.get_frame().set_edgecolor("black")
-            legend.get_frame().set_linewidth(1.0)
+
+        # ====================== 修改在这里 ======================
+        legend = ax.legend(
+            loc="upper right",
+            bbox_to_anchor=(1.0, 0.90),
+            frameon=True,
+            fontsize=12,
+            labelspacing=0.2
+        )
+        legend.get_frame().set_edgecolor("black")
+        legend.get_frame().set_linewidth(1.0)
+        # =======================================================
 
     plt.tight_layout()
     plt.subplots_adjust(left=0.08, wspace=0.2, hspace=0.25)
@@ -494,16 +551,21 @@ PLOT_TIMES = np.unique(np.concatenate([
 
 
 def main():
+    # Compile once in the parent so a compilation error fails promptly,
+    # rather than repeatedly restarting failed Pool initializer processes.
+    if MCS_TOTAL < 2 or NUM_RUNS < 2 or N != L * L:
+        raise ValueError("Require MCS_TOTAL>=2, NUM_RUNS>=2 and N=L*L.")
+    initialize_worker(L)
     start_time = time.perf_counter()
     started_at = dt.datetime.now().astimezone().isoformat()
-    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     output_dir = Path(f"3581Final_Data_u{MUTATION_RATE}_audit") / f"run_{timestamp}"
 
     total_cores = os.cpu_count() or 1
     worker_count = max(1, int(total_cores * CPU_FRACTION))
     print(f"演化模拟开始: u={MUTATION_RATE}, Runs={NUM_RUNS}")
     print(f"模拟时长: {MCS_TOTAL} MCS; 快照时刻: {SNAPSHOT_TIMES}")
-    print(f"全局认可度: 每个 MCS 开始时计算一次，并在该 MCS 内缓存")
+    print(f"全局认可度: 轮内随策略变化增量更新，声誉在轮末同步更新")
     print(f"CPU 配额: {CPU_FRACTION:.0%}，使用 {worker_count}/{total_cores} 个逻辑核心")
 
     condition_stats = {}
@@ -590,9 +652,11 @@ def main():
     print(f"结果目录: {output_dir.resolve()}")
     print(f"PNG图像文件: {png_fig.resolve()}")
     print(f"EPS矢量图像文件: {eps_fig.resolve()}")
-    print(f"误差棒: 各独立运行的标准差；置信区间: 95% bootstrap percentile CI")
+    print("阴影: 均值的逐点95% Student-t区间；误差棒: 快照均值的95% bootstrap percentile区间")
     print(f"收敛判据: 相邻两个 {CONVERGENCE_WINDOW} MCS 窗口均值差的绝对值 <= {CONVERGENCE_TOL}")
 
 
 if __name__ == "__main__":
+    mp.freeze_support()
+    prepare_run_directory(__file__, globals())
     main()

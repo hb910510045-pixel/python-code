@@ -25,10 +25,10 @@ K = 0.1
 FIXED_B = 1.11
 
 # Current user-selected run length. The paper-scale setting is 20000 MCS.
-MCS_TOTAL = 2000
-MCS_TRANSIENT = 1700
+MCS_TOTAL = 20000
+MCS_TRANSIENT = 17000
 INIT_COOP_RATE = 0.5
-NUM_RUNS = 50
+NUM_RUNS = 100
 
 LAMBDA_VAL = 0.1
 MUTATION_RATE = 0.05
@@ -469,6 +469,7 @@ def save_outputs(output_dir, condition_stats, finalized, runtime_report,
 
 
 def plot_results(finalized, output_dir):
+    from matplotlib.colors import to_rgb
     plt.rcParams["font.family"] = "serif"
     plt.rcParams["font.serif"] = ["Times New Roman"]
     plt.rcParams["mathtext.fontset"] = "stix"
@@ -483,13 +484,15 @@ def plot_results(finalized, output_dir):
         for alpha_index, alpha in enumerate(ALPHA_VALUES):
             state = finalized[(panel, alpha_index)]
             color = colors[alpha_index]
+            # Preblend with white: same pale fill in PNG and EPS.
+            band_color = tuple(0.60 + 0.40 * c for c in to_rgb(color))
             x = PLOT_TIMES
 
             # Use many logarithmically spaced points for a smooth mean
             # trajectory. The shaded band is the pointwise 95% CI.
             ax.fill_between(x, state["ci_low"], state["ci_high"],
-                            color=color, alpha=0.12, linewidth=0)
-            ax.plot(x, state["mean"], color=color, linewidth=2.0,
+                            color=band_color, alpha=1.0, linewidth=0, zorder=1)
+            ax.plot(x, state["mean"], color=color, linewidth=1.0, zorder=3,
                     label=rf"$\alpha = {alpha:.3f}$")
 
             # Display the 95% bootstrap confidence interval at the same
@@ -501,6 +504,53 @@ def plot_results(finalized, output_dir):
             ax.errorbar(SNAPSHOT_TIMES, snap_mean, yerr=yerr,
                         fmt="none", ecolor=color, elinewidth=0.8,
                         capsize=2.0, alpha=0.65)
+
+        # Show the true narrow CI at readable scale, without widening it.
+        # Only the existing alpha=0.80 late-time curve is enlarged.
+        zoom_index = ALPHA_VALUES.index(0.80)
+        zoom_state = finalized[(panel, zoom_index)]
+        zoom_color = colors[zoom_index]
+        zoom_band_color = tuple(0.60 + 0.40 * c for c in to_rgb(zoom_color))
+        late = np.asarray(x) >= MCS_TOTAL / 2.0
+        if np.count_nonzero(late) >= 2:
+            zoom = ax.inset_axes([0.53, 0.26, 0.43, 0.23], zorder=6)
+            zoom.fill_between(
+                np.asarray(x)[late], zoom_state["ci_low"][late],
+                zoom_state["ci_high"][late], color=zoom_band_color,
+                alpha=1.0, linewidth=0, zorder=1)
+            zoom.plot(np.asarray(x)[late], zoom_state["mean"][late],
+                      color=zoom_color, linewidth=0.8, zorder=3)
+            snap_t = np.asarray(SNAPSHOT_TIMES)
+            late_snap = snap_t >= np.asarray(x)[late][0]
+            zoom_mean = zoom_state["snapshot_mean"][late_snap]
+            zoom_yerr = np.vstack((
+                zoom_mean - zoom_state["bootstrap_low"][late_snap],
+                zoom_state["bootstrap_high"][late_snap] - zoom_mean))
+            zoom.errorbar(snap_t[late_snap], zoom_mean, yerr=zoom_yerr,
+                          fmt="none", ecolor=zoom_color, elinewidth=1.0,
+                          capsize=3.0, capthick=1.0, alpha=1.0, zorder=5)
+            lower = float(np.min(zoom_state["ci_low"][late]))
+            upper = float(np.max(zoom_state["ci_high"][late]))
+            if np.any(late_snap):
+                lower = min(lower, float(np.min(
+                    zoom_state["bootstrap_low"][late_snap])))
+                upper = max(upper, float(np.max(
+                    zoom_state["bootstrap_high"][late_snap])))
+            padding = max((upper - lower) * 0.15, 1e-5)
+            zoom.set_ylim(max(0.0, lower - padding),
+                          min(1.0, upper + padding))
+            zoom.set_xscale("log")
+            zoom.set_xlim(np.asarray(x)[late][0] / 1.02, x[-1] * 1.02)
+            zoom.set_xticks([np.asarray(x)[late][0], x[-1]])
+            zoom.set_xticklabels([str(int(np.asarray(x)[late][0])),
+                                  str(int(x[-1]))])
+            zoom.minorticks_off()
+            zoom.locator_params(axis="y", nbins=3)
+            zoom.ticklabel_format(axis="y", style="plain", useOffset=False)
+            zoom.tick_params(direction="in", labelsize=7, top=True,
+                             right=True, length=2)
+            zoom.set_title(r"$\alpha=0.80$: late-time zoom", fontsize=8,
+                           pad=3)
 
         ax.set_xscale("log")
         ax.set_xlim(1, MCS_TOTAL)

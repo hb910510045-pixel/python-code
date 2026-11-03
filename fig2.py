@@ -1,3 +1,4 @@
+from model_rules import mcs_fixed, PROTOCOL_ID, prepare_run_directory
 import numpy as np
 import matplotlib.pyplot as plt
 from numba import jit, prange  # 引入 prange 用于多线程并行
@@ -57,75 +58,15 @@ def calculate_payoff(s_i, s_j, b):
 def run_simulation_core(L, N, K, b, alpha, beta, lam, epsilon, u, mcs_steps, avg_steps, neighbor_map):
     strategies = (np.random.random(N) < 0.5).astype(np.int64)
     reputations = np.full(N, 0.5, dtype=np.float64)
-
     fc_sum = 0.0
     count_avg = 0
-    avg_start_step = mcs_steps - avg_steps
-    inv_K = 1.0 / K  # 【优化2】提前计算乘法常数，替代除法
-
-    for t in range(mcs_steps):
-        total_rep = np.sum(reputations) + N * epsilon
-        sum_c_rep = 0.0
-        for i in range(N):
-            if strategies[i] == 1:
-                sum_c_rep += reputations[i] + epsilon
-
-        gpop_c = sum_c_rep / total_rep
-        gpop_d = 1.0 - gpop_c
-
-        for _ in range(N):
-            i = np.random.randint(0, N)
-            if np.random.random() < u:
-                strategies[i] = np.random.randint(0, 2)
-            else:
-                j = neighbor_map[i, np.random.randint(0, 4)]
-                if strategies[i] != strategies[j]:
-                    si, ri = strategies[i], reputations[i]
-                    pi = 0.0
-                    l_num_i, l_den_i = ri + epsilon, ri + epsilon
-                    for idx in range(4):
-                        nb = neighbor_map[i, idx]
-                        pi += calculate_payoff(si, strategies[nb], b)
-                        w = reputations[nb] + epsilon
-                        l_den_i += w
-                        if strategies[nb] == si:
-                            l_num_i += w
-
-                    lpop_i = l_num_i / l_den_i
-                    tpop_i = alpha * lpop_i + (1.0 - alpha) * (gpop_c if si == 1 else gpop_d)
-                    Fi = pi * (max(tpop_i, 1e-9) ** beta)
-
-                    sj, rj = strategies[j], reputations[j]
-                    pj = 0.0
-                    l_num_j, l_den_j = rj + epsilon, rj + epsilon
-                    for idx in range(4):
-                        nb = neighbor_map[j, idx]
-                        pj += calculate_payoff(sj, strategies[nb], b)
-                        w = reputations[nb] + epsilon
-                        l_den_j += w
-                        if strategies[nb] == sj:
-                            l_num_j += w
-
-                    lpop_j = l_num_j / l_den_j
-                    tpop_j = alpha * lpop_j + (1.0 - alpha) * (gpop_c if sj == 1 else gpop_d)
-                    Fj = pj * (max(tpop_j, 1e-9) ** beta)
-
-                    # 【优化2】使用乘法 inv_K 替代原来的除法 / K
-                    fermi_prob = 1.0 / (1.0 + np.exp((Fi - Fj) * inv_K))
-                    if np.random.random() < fermi_prob:
-                        strategies[i] = strategies[j]
-
-        for i in range(N):
-            reputations[i] = (1.0 - lam) * reputations[i] + lam * float(strategies[i])
-
-        if t >= avg_start_step:
+    for step in range(mcs_steps):
+        mcs_fixed(strategies, reputations, neighbor_map, K, b,
+                  alpha, beta, lam, epsilon, u)
+        if step >= mcs_steps - avg_steps:
             fc_sum += np.mean(strategies)
             count_avg += 1
-
-    if count_avg > 0:
-        return fc_sum / count_avg
-    else:
-        return 0.0
+    return fc_sum / count_avg if count_avg else 0.0
 
 
 # ==========================================
@@ -247,4 +188,5 @@ def plot_heatmap(data_matrix):
 
 
 if __name__ == "__main__":
+    prepare_run_directory(__file__, globals())
     main()

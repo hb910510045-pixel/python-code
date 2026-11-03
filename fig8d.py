@@ -1,6 +1,8 @@
+# Updating protocol fixed to the manuscript; historical results require recomputation.
 """Noise-level robustness test for the supplied spatial reputation model.
 
-This script only generates the requested simulation code.  It scans K while
+This script runs independent simulations. It requires model_rules.py in
+the same directory and scans K while
 keeping alpha=0.80 and beta=0.50, preserves the original figure style, and
 saves TXT, PNG, and EPS files.  The default worker count is approximately
 60% of the logical CPU cores; each worker is restricted to one numerical
@@ -22,6 +24,7 @@ from pathlib import Path
 
 import numpy as np
 from numba import njit
+from model_rules import mcs_fixed, PROTOCOL_ID, prepare_run_directory
 from tqdm import tqdm
 
 
@@ -74,78 +77,9 @@ def calculate_payoff(strategy_i, strategy_j, b):
 
 
 @njit(cache=True)
-def simulation_step(population, noise_K, b, alpha, beta, gamma, epsilon, u,
-                    strategies, reputations, neighbor_map):
-    # Global reputation-weighted popularity is a snapshot at the start of MCS.
-    total_reputation = np.sum(reputations) + population * epsilon
-    cooperator_reputation = 0.0
-    for i in range(population):
-        if strategies[i] == 1:
-            cooperator_reputation += reputations[i] + epsilon
-
-    global_C = cooperator_reputation / total_reputation
-    global_D = 1.0 - global_C
-
-    # Random asynchronous updating: every player is selected once on average.
-    for i in np.random.permutation(population):
-        # Mutation is a random reset; it is not a guaranteed strategy flip.
-        if np.random.random() < u:
-            strategies[i] = np.random.randint(0, 2)
-            continue
-
-        j = neighbor_map[i, np.random.randint(0, 4)]
-        if strategies[i] == strategies[j]:
-            continue
-
-        payoff_i = 0.0
-        numerator_i = reputations[i] + epsilon
-        denominator_i = reputations[i] + epsilon
-        for neighbor_index in range(4):
-            neighbor = neighbor_map[i, neighbor_index]
-            payoff_i += calculate_payoff(strategies[i], strategies[neighbor], b)
-            weight = reputations[neighbor] + epsilon
-            denominator_i += weight
-            if strategies[neighbor] == strategies[i]:
-                numerator_i += weight
-        local_i = numerator_i / denominator_i
-        total_i = alpha * local_i + (1.0 - alpha) * (
-            global_C if strategies[i] == 1 else global_D
-        )
-        if total_i < 1e-9:
-            total_i = 1e-9
-        fitness_i = payoff_i * (total_i ** beta)
-
-        payoff_j = 0.0
-        numerator_j = reputations[j] + epsilon
-        denominator_j = reputations[j] + epsilon
-        for neighbor_index in range(4):
-            neighbor = neighbor_map[j, neighbor_index]
-            payoff_j += calculate_payoff(strategies[j], strategies[neighbor], b)
-            weight = reputations[neighbor] + epsilon
-            denominator_j += weight
-            if strategies[neighbor] == strategies[j]:
-                numerator_j += weight
-        local_j = numerator_j / denominator_j
-        total_j = alpha * local_j + (1.0 - alpha) * (
-            global_C if strategies[j] == 1 else global_D
-        )
-        if total_j < 1e-9:
-            total_j = 1e-9
-        fitness_j = payoff_j * (total_j ** beta)
-
-        exponent = (fitness_i - fitness_j) / noise_K
-        if exponent > 20.0:
-            imitation_probability = 0.0
-        elif exponent < -20.0:
-            imitation_probability = 1.0
-        else:
-            imitation_probability = 1.0 / (1.0 + np.exp(exponent))
-        if np.random.random() < imitation_probability:
-            strategies[i] = strategies[j]
-
-    # Synchronous EMA reputation update at the end of MCS.
-    for i in range(population):
-        reputations[i] = (1.0 - gamma) * reputations[i] + gamma * float(strategies[i])
+def simulation_step(population, noise_K, b, alpha, beta, gamma, epsilon, u, strategies, reputations, neighbor_map):
+    mcs_fixed(strategies, reputations, neighbor_map, noise_K, b,
+              alpha, beta, gamma, epsilon, u)
     return strategies, reputations
 
 
@@ -270,7 +204,7 @@ def main():
     parser.add_argument('--workers', type=int, default=None,
                         help='Override the default approximately-60%% worker count.')
     parser.add_argument('--output-dir', type=Path,
-                        default=Path(__file__).resolve().parent / 'noise_level_results')
+                        default=Path(__file__).resolve().parent / 'noise_level_results_current_protocol')
     arguments = parser.parse_args()
 
     if arguments.smoke_test:
@@ -318,6 +252,7 @@ def main():
         )
     )
     summary_path = output_dir / (file_stem + '_summary.txt')
+    raw_path = output_dir / (file_stem + '_individual_runs.txt')
 
     metadata = (
         'alpha={} beta={} gamma={} u_reset={} u_flip={} epsilon={}\n'.format(
@@ -333,16 +268,21 @@ def main():
         + 'initialization=independent_Bernoulli(p_C={}); reputation_initial=0.5\n'.format(
             INITIAL_C_PROBABILITY
         )
-        + 'periodic_boundary=True degree=4; asynchronous_strategy_update=True; '
-          'synchronous_reputation_update=True\n'
+        + 'periodic_boundary=True degree=4; update=random_with_replacement_per_MCS; '
+          'global_endorsement=current_configuration_incremental; '
+          'reputation_update=synchronous_end_of_MCS; '
+          'mutation=random_strategy_reset_without_reputation_reset\n'
         + 'fc_mean=mean_of_independent_run_time_means; '
           'fc_std=sample_std(ddof=1); fc_sem=fc_std/sqrt(NUM_RUNS)\n'
     )
 
     run_values = np.full((len(k_values), len(b_values), number_of_runs), np.nan)
 
-    with summary_path.open('w', encoding='utf-8') as summary_file:
+    with summary_path.open('w', encoding='utf-8') as summary_file, \
+            raw_path.open('w', encoding='utf-8') as raw_file:
         write_header(summary_file, metadata, 'K b fc_mean fc_std fc_sem n_runs')
+        write_header(raw_file, metadata,
+                     'k_index b_index run_index seed K b fc_initial_actual fc_run absorbed_mcs')
 
         # Only the main process writes files. This prevents interleaved TXT output.
         context = mp.get_context('spawn')
@@ -358,6 +298,11 @@ def main():
                 (k_index, b_index, run_index, seed, cooperation,
                  initial_cooperation, absorbed_mcs) = result
                 run_values[k_index, b_index, run_index] = cooperation
+                raw_file.write(
+                    '{} {} {} {} {:.8f} {:.8f} {:.10f} {:.10f} {}\n'.format(
+                        k_index, b_index, run_index, seed, k_values[k_index],
+                        b_values[b_index], initial_cooperation, cooperation, absorbed_mcs))
+                raw_file.flush()
 
         for k_index, noise_K in enumerate(k_values):
             for b_index, b in enumerate(b_values):
@@ -376,9 +321,11 @@ def main():
     save_plot(k_values, b_values, mean_data, output_dir, file_stem,
               show=not arguments.no_show)
     print('Summary TXT:', summary_path)
+    print('Individual runs TXT:', raw_path)
 
 
 if __name__ == '__main__':
+    prepare_run_directory(__file__, globals())
     mp.freeze_support()
     main()
 

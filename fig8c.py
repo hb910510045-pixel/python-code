@@ -1,13 +1,12 @@
 # Updating protocol fixed to the manuscript; historical results require recomputation.
-from model_rules import (mcs_fixed, mcs_csr, mcs_square, periodic_neighbors,
-                         PROTOCOL_ID, prepare_run_directory)
 """Compare initial cooperator fractions with the supplied spatial-game model.
 
 Run this file directly in PyCharm or with:
     python initial_conditions_comparison.py
-Results are saved in initial_condition_results next to this script.
+Results are saved in initial_condition_results_current_protocol next to this script.
+Keep model_rules.py in the same directory.
 
-This standalone script scans f_c(0) only. Initial cooperator counts are fixed
+This script scans f_c(0) only. Initial cooperator counts are fixed
 and their locations are randomized independently in every realization.
 The model dynamics and plotting style follow the supplied source code.
 About 60% of logical CPU cores are used as single-thread worker processes;
@@ -29,6 +28,7 @@ from pathlib import Path
 
 import numpy as np
 from numba import njit
+from model_rules import mcs_fixed, PROTOCOL_ID, prepare_run_directory
 from tqdm import tqdm
 
 
@@ -82,6 +82,7 @@ def calculate_payoff(strategy_i, strategy_j, b):
 def simulation_step(population, noise_K, b, alpha, beta, gamma, epsilon, u, strategies, reputations, neighbor_map):
     mcs_fixed(strategies, reputations, neighbor_map, noise_K, b,
               alpha, beta, gamma, epsilon, u)
+    return strategies, reputations
 
 
 @njit(cache=True)
@@ -288,6 +289,7 @@ def main():
         )
     )
     summary_path = output_dir / (file_stem + '_summary.txt')
+    raw_path = output_dir / (file_stem + '_individual_runs.txt')
     metadata = (
         'alpha={} beta={} gamma={} u_reset={} u_flip={} K={} epsilon={}\n'.format(
             FIXED_ALPHA, FIXED_BETA, FIXED_GAMMA, FIXED_U,
@@ -327,8 +329,11 @@ def main():
     summary_columns = 'fc_initial_target b fc_mean fc_std fc_sem n_runs'
 
     # 数据只由主进程写入，避免多进程写入造成文件交错。
-    with summary_path.open('w', encoding='utf-8') as summary_file:
+    with summary_path.open('w', encoding='utf-8') as summary_file, \
+            raw_path.open('w', encoding='utf-8') as raw_file:
         write_header(summary_file, metadata, summary_columns)
+        write_header(raw_file, metadata,
+                     'initial_index b_index run_index seed fc_initial_target b fc_initial_actual fc_run absorbed_mcs')
         context = mp.get_context('spawn')
         with context.Pool(
             processes=workers,
@@ -345,6 +350,11 @@ def main():
                 completed_counts[initial_index, b_index] += 1
                 initial_fraction = initial_values[initial_index]
                 b = b_values[b_index]
+                raw_file.write(
+                    '{} {} {} {} {:.8f} {:.8f} {:.10f} {:.10f} {}\n'.format(
+                        initial_index, b_index, run_index, seed, initial_fraction, b,
+                        actual_initial_fc, fc, absorbed_mcs))
+                raw_file.flush()
 
                 if completed_counts[initial_index, b_index] == NUM_RUNS:
                     write_summary_row(summary_file, initial_fraction, b,
@@ -360,6 +370,7 @@ def main():
                                   run_values[initial_index, b_index])
 
     print('Summary TXT:', summary_path)
+    print('Individual runs TXT:', raw_path)
     mean_data = np.mean(run_values, axis=2)
     save_plot(initial_values, b_values, mean_data, output_dir, file_stem,
               show=not arguments.no_show)

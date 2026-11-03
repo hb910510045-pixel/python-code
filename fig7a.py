@@ -1,6 +1,7 @@
 # Updating protocol fixed to the manuscript; historical results require recomputation.
 from model_rules import (mcs_fixed, mcs_csr, mcs_square, periodic_neighbors,
                          PROTOCOL_ID, prepare_run_directory)
+import json
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -57,7 +58,7 @@ OUTPUT_DIR = Path(__file__).resolve().parent / "7a_results_current_protocol"
 
 
 # ============================================================
-# 2. Lattice and immediate-reputation dynamics
+# 2. Lattice and synchronous end-MCS reputation dynamics
 # ============================================================
 @njit
 def build_neighbor_map(L):
@@ -159,24 +160,46 @@ def average_fc(L, l_index, u_index, u_value, b_value, neighbors, executor=None):
     return float(np.mean(np.asarray(values, dtype=np.float64)))
 
 
-def estimate_bcr(L, l_index, u_index, u_value, neighbors, executor=None):
-    """Find the largest b for which mean(fc) >= FC_THRESHOLD."""
-    b_low = B_LOW_INIT
-    b_high = B_HIGH_INIT
-    fc_low = average_fc(L, l_index, u_index, u_value, b_low, neighbors, executor)
-    if fc_low < FC_THRESHOLD:
-        return b_low
-    fc_high = average_fc(L, l_index, u_index, u_value, b_high, neighbors, executor)
-    if fc_high >= FC_THRESHOLD:
-        return b_high
-    while (b_high - b_low) > B_TOLERANCE:
+def estimate_bcr(L, l_index, u_index, u_value, neighbors, executor=None,
+                 return_details=False):
+    """Bisect a qualifying/nonqualifying bracket; unresolved points return NaN.
+
+    This assumes a single downward threshold crossing. B_TOLERANCE is
+    numerical resolution, not a confidence interval for the threshold.
+    """
+    b_low, b_high = float(B_LOW_INIT), float(B_HIGH_INIT)
+    if not (np.isfinite(b_low) and np.isfinite(b_high) and b_low < b_high
+            and np.isfinite(B_TOLERANCE) and B_TOLERANCE > 0):
+        raise ValueError("Require finite ordered b bounds and positive tolerance.")
+    evaluations = []
+    def evaluate(b):
+        value = average_fc(L, l_index, u_index, u_value, b, neighbors, executor)
+        if not np.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError("Invalid average cooperator fraction.")
+        evaluations.append({"b": float(b), "mean_fc": float(value)})
+        return value
+    def finish(value, status, lower, upper):
+        details = {"L": int(L), "l_index": int(l_index),
+                   "u_index": int(u_index), "u": float(u_value),
+                   "status": status,
+                   "bcr": float(value) if np.isfinite(value) else None,
+                   "lower_bound": lower, "upper_bound": upper,
+                   "criterion": float(FC_THRESHOLD),
+                   "numerical_tolerance": float(B_TOLERANCE),
+                   "evaluations": evaluations,
+                   "seeds": [make_seed(l_index, u_index, r) for r in range(NUM_RUNS)]}
+        return (value, details) if return_details else value
+    if evaluate(b_low) < FC_THRESHOLD:
+        return finish(float("nan"), "lower_bound_not_qualified", None, b_low)
+    if evaluate(b_high) >= FC_THRESHOLD:
+        return finish(float("nan"), "right_censored", b_high, None)
+    while b_high - b_low > B_TOLERANCE:
         b_mid = 0.5 * (b_low + b_high)
-        fc_mid = average_fc(L, l_index, u_index, u_value, b_mid, neighbors, executor)
-        if fc_mid >= FC_THRESHOLD:
+        if evaluate(b_mid) >= FC_THRESHOLD:
             b_low = b_mid
         else:
             b_high = b_mid
-    return b_low
+    return finish(b_low, "resolved", b_low, b_high)
 
 
 # ============================================================
@@ -244,7 +267,10 @@ def save_combined_plot(lattice_values, u_values, results_by_L):
                 **line_style)
         # 与原代码一致：原始曲线最高点用同色实心圆单独突出。
         # 若有并列最大值，np.argmax 选择 u 最小的那个点。
-        peak_index = int(np.argmax(bcr))
+        if not np.any(np.isfinite(bcr)):
+            print(f"L={L}: no resolved threshold in the search interval")
+            continue
+        peak_index = int(np.nanargmax(bcr))
         ax.scatter(u[peak_index], bcr[peak_index], color=colors.get(L, fallback_colors[index % len(fallback_colors)]),
                    marker="o", s=45, linewidths=0, zorder=10 + index,
                    label="_nolegend_")
@@ -286,6 +312,7 @@ def main():
     lattice_values = normalize_l_values(L_VALUES)
     u_values = make_u_values()
     all_summary = []
+    threshold_records = []
     results_by_L = {}
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     print(f"Output directory: {OUTPUT_DIR.resolve()}")
@@ -307,17 +334,26 @@ def main():
             initargs=(L,),
         ) as executor:
             for u_index, u_value in enumerate(u_values):
-                bcr = estimate_bcr(
+                bcr, details = estimate_bcr(
                     L, l_index, u_index, float(u_value), neighbors, executor,
+                    return_details=True,
                 )
+                threshold_records.append(details)
+                status_path = OUTPUT_DIR / "threshold_status_and_evaluations.json"
+                status_path.write_text(json.dumps(
+                    {"protocol": PROTOCOL_ID, "thresholds": threshold_records},
+                    ensure_ascii=False, indent=2), encoding="utf-8")
                 bcr_results.append(bcr)
-                print(f"L={L}, u={u_value:.4f} -> b_cr={bcr:.4f}")
+                print(f"L={L}, u={u_value:.4f} -> b_cr={bcr:.4f}, status={details['status']}")
         bcr_results = np.asarray(bcr_results, dtype=np.float64)
         results_by_L[L] = bcr_results
         data_name = save_data(L, u_values, bcr_results)
         for u_value, bcr in zip(u_values, bcr_results):
             all_summary.append([L, u_value, bcr])
-        optimal_u_index = int(np.argmax(bcr_results))
+        if not np.any(np.isfinite(bcr_results)):
+            print(f"L={L}: no resolved threshold; see status JSON")
+            continue
+        optimal_u_index = int(np.nanargmax(bcr_results))
         print(f"Saved data: {Path(data_name).resolve()}")
         print(
             f"L={L}: raw-grid optimum "

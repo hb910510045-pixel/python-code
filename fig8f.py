@@ -38,6 +38,7 @@ from time import perf_counter
 
 import numpy as np
 from numba import njit
+from model_rules import mcs_csr, PROTOCOL_ID, prepare_run_directory
 from tqdm import tqdm
 
 # ==========================================================
@@ -127,51 +128,9 @@ def calculate_fitness(node, b, alpha, beta, epsilon, global_c, strategies,
 @njit(cache=True)
 def simulation_step(noise_k, b, alpha, beta, gamma, epsilon, u,
                     strategies, reputations, offsets, neighbors):
-    population = len(strategies)
-
-    # Global endorsement is a snapshot taken at the beginning of the MCS.
-    total_reputation = np.sum(reputations) + population * epsilon
-    cooperator_reputation = 0.0
-    for i in range(population):
-        if strategies[i] == 1:
-            cooperator_reputation += reputations[i] + epsilon
-    global_c = cooperator_reputation / total_reputation
-
-    # Each player is selected once per MCS in a random order.
-    for i in np.random.permutation(population):
-        if np.random.random() < u:
-            strategies[i] = np.random.randint(0, 2)
-            continue
-
-        degree_i = offsets[i + 1] - offsets[i]
-        if degree_i == 0:
-            continue
-        j = neighbors[offsets[i] + np.random.randint(0, degree_i)]
-        if strategies[i] == strategies[j]:
-            continue
-
-        fitness_i = calculate_fitness(
-            i, b, alpha, beta, epsilon, global_c,
-            strategies, reputations, offsets, neighbors,
-        )
-        fitness_j = calculate_fitness(
-            j, b, alpha, beta, epsilon, global_c,
-            strategies, reputations, offsets, neighbors,
-        )
-
-        exponent = (fitness_i - fitness_j) / noise_k
-        if exponent > 20.0:
-            imitation_probability = 0.0
-        elif exponent < -20.0:
-            imitation_probability = 1.0
-        else:
-            imitation_probability = 1.0 / (1.0 + np.exp(exponent))
-        if np.random.random() < imitation_probability:
-            strategies[i] = strategies[j]
-
-    # Synchronous EMA reputation update at the end of each MCS.
-    for i in range(population):
-        reputations[i] = (1.0 - gamma) * reputations[i] + gamma * float(strategies[i])
+    # Shared rule: replacement sampling, current endorsement, end-MCS EMA.
+    mcs_csr(strategies, reputations, offsets, neighbors, noise_k, b,
+            alpha, beta, gamma, epsilon, u)
 
 
 @njit(cache=True)
@@ -399,7 +358,7 @@ def main():
     parser.add_argument('--workers', type=int, default=None,
                         help='Override worker count; default uses about 60% of cores.')
     parser.add_argument('--output-dir', type=Path,
-                        default=Path(__file__).resolve().parent / 'epsilon_sensitivity_results',
+                        default=Path(__file__).resolve().parent / 'epsilon_sensitivity_results_current_protocol',
                         help='Output root; each invocation creates a timestamped directory.')
     arguments = parser.parse_args()
 
@@ -444,8 +403,8 @@ def main():
         f'MCS_TOTAL={MCS_TOTAL} MCS_TRANSIENT={MCS_TRANSIENT} '
         f'averaging_MCS={MCS_TOTAL - MCS_TRANSIENT} NUM_RUNS={NUM_RUNS}\n'
         'payoff=weak_PD_R1_S0_Tb_P0; fitness=accumulated_payoff*endorsement**beta; '
-        'local_endorsement=neighbors_plus_self; global_endorsement=start_of_MCS_snapshot\n'
-        'update=random_permutation_each_MCS; reputation_update=synchronous_end_of_MCS; '
+        'local_endorsement=neighbors_plus_self; global_endorsement=current_configuration_incremental\n'
+        'update=random_with_replacement_per_MCS; reputation_update=synchronous_end_of_MCS; '
         'mutation=random_strategy_reset_without_reputation_reset\n'
         f'early_stop_absorbing={EARLY_STOP_ABSORBING} '
         f'all_edges_check_interval={ABSORB_CHECK_INTERVAL}; '
@@ -579,5 +538,6 @@ def main():
 
 
 if __name__ == '__main__':
+    prepare_run_directory(__file__, globals())
     mp.freeze_support()
     main()

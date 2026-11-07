@@ -1,3 +1,6 @@
+# Updating protocol fixed to the manuscript; historical results require recomputation.
+from model_rules import (mcs_fixed, mcs_csr, mcs_square, periodic_neighbors,
+                         PROTOCOL_ID, prepare_run_directory)
 # -*- coding: utf-8 -*-
 """Regularization-constant sensitivity analysis for the supplied model.
 
@@ -38,7 +41,6 @@ from time import perf_counter
 
 import numpy as np
 from numba import njit
-from model_rules import mcs_csr, PROTOCOL_ID, prepare_run_directory
 from tqdm import tqdm
 
 # ==========================================================
@@ -126,9 +128,7 @@ def calculate_fitness(node, b, alpha, beta, epsilon, global_c, strategies,
 
 
 @njit(cache=True)
-def simulation_step(noise_k, b, alpha, beta, gamma, epsilon, u,
-                    strategies, reputations, offsets, neighbors):
-    # Shared rule: replacement sampling, current endorsement, end-MCS EMA.
+def simulation_step(noise_k, b, alpha, beta, gamma, epsilon, u, strategies, reputations, offsets, neighbors):
     mcs_csr(strategies, reputations, offsets, neighbors, noise_k, b,
             alpha, beta, gamma, epsilon, u)
 
@@ -282,7 +282,7 @@ def save_plot(epsilon_values, b_values, mean_data, output_dir, file_stem, show):
 
     # 唯一改动的部分：将 loc='lower left' 修改为 loc='upper right'
     axis.legend(fontsize=13, frameon=True, framealpha=1.0,
-                edgecolor='black', loc='upper right', handlelength=1.5)
+                edgecolor='black', loc='lower left', handlelength=1.5)
 
     plt.tight_layout()
 

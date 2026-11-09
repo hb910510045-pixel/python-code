@@ -10,9 +10,9 @@ import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.ticker import LogFormatterMathtext, NullFormatter
 import numpy as np
 from numba import jit, njit
-from scipy.stats import t as student_t
 from tqdm import tqdm
 
 
@@ -24,9 +24,9 @@ N = L * L
 K = 0.1
 FIXED_B = 1.11
 
-# Current user-selected run length. The paper-scale setting is 20000 MCS.
-MCS_TOTAL = 20000
-MCS_TRANSIENT = 17000
+# Stop all simulation and data collection at 10000 elapsed MCS.
+MCS_TOTAL = 10000
+MCS_TRANSIENT = 7000
 INIT_COOP_RATE = 0.5
 NUM_RUNS = 100
 
@@ -54,19 +54,14 @@ if SMOKE_TEST:
 
 # Convergence diagnostics compare two adjacent windows at the end.
 REQUESTED_CONVERGENCE_WINDOW = 3000
-CONVERGENCE_WINDOW = min(REQUESTED_CONVERGENCE_WINDOW, max(1, MCS_TOTAL // 4))
+CONVERGENCE_WINDOW = min(REQUESTED_CONVERGENCE_WINDOW, max(1, MCS_TOTAL // 2))
 CONVERGENCE_TOL = 0.01
 
-# The full trajectory is kept in each worker, while only these points
-# are retained by the parent process for plotting and output.
-PLOT_STRIDE = 100
-PLOT_POINT_COUNT = 200
-REQUESTED_SNAPSHOT_TIMES = (1, 10, 100, 1000, 10000, 20000)
+# Keep statistics at every recorded integer MCS, including initialization.
+REQUESTED_SNAPSHOT_TIMES = (1, 10, 100, 1000, 10000)
 SNAPSHOT_TIMES = tuple(sorted(set(
     [t for t in REQUESTED_SNAPSHOT_TIMES if 1 <= t <= MCS_TOTAL] + [MCS_TOTAL]
 )))
-N_BOOTSTRAP = 2000
-# Student-t critical values are computed from each condition's actual count.
 
 WORKER_NEIGHBOR_MAP = None
 
@@ -300,16 +295,6 @@ def run_single_simulation(task):
 # ============================================================
 # 4. Statistics, confidence intervals, and output
 # ============================================================
-def bootstrap_mean_ci(values, seed):
-    """Pointwise 95% percentile bootstrap CI for the sample mean."""
-    values = np.asarray(values, dtype=np.float64)
-    n = values.shape[0]
-    rng = np.random.default_rng(seed)
-    indices = rng.integers(0, n, size=(N_BOOTSTRAP, n))
-    bootstrap_means = values[indices].mean(axis=1)
-    return tuple(np.percentile(bootstrap_means, [2.5, 97.5], axis=0))
-
-
 def write_csv(path, fieldnames, rows):
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -329,18 +314,7 @@ def finalize_condition_statistics(condition_stats):
         else:
             std = np.zeros_like(mean)
 
-        critical = float(student_t.ppf(0.975, n - 1)) if n > 1 else 0.0
-        ci_low = mean - critical * std / np.sqrt(max(n, 1))
-        ci_high = mean + critical * std / np.sqrt(max(n, 1))
-        ci_low = np.clip(ci_low, 0.0, 1.0)
-        ci_high = np.clip(ci_high, 0.0, 1.0)
-
         snapshot_values = np.vstack(state["snapshot_values"])
-        boot_low, boot_high = bootstrap_mean_ci(
-            snapshot_values,
-            seed=BASE_SEED + 100000 + 100 * key[0] + key[1]
-        )
-
         snapshot_mean = snapshot_values.mean(axis=0)
         snapshot_std = (
             snapshot_values.std(axis=0, ddof=1)
@@ -353,13 +327,14 @@ def finalize_condition_statistics(condition_stats):
             "count": n,
             "mean": mean,
             "std": std,
-            "ci_low": ci_low,
-            "ci_high": ci_high,
+            "min_fc": state["min_fc"],
+            "max_fc": state["max_fc"],
+            "cloud_values": np.vstack(state["cloud_values"]),
             "snapshot_values": snapshot_values,
             "snapshot_mean": snapshot_mean,
             "snapshot_std": snapshot_std,
-            "bootstrap_low": np.asarray(boot_low),
-            "bootstrap_high": np.asarray(boot_high),
+            "snapshot_min": snapshot_values.min(axis=0),
+            "snapshot_max": snapshot_values.max(axis=0),
             "runtime_seconds": state["runtime_seconds"],
         }
     return finalized
@@ -392,7 +367,10 @@ def save_outputs(output_dir, condition_stats, finalized, runtime_report,
             "CONVERGENCE_WINDOW": CONVERGENCE_WINDOW,
             "CONVERGENCE_TOL": CONVERGENCE_TOL,
             "SNAPSHOT_TIMES": SNAPSHOT_TIMES,
-            "N_BOOTSTRAP": N_BOOTSTRAP,
+            "band": "observed_minimum_to_maximum_across_independent_runs",
+            "sample_cloud_mcs": CLOUD_TIMES.tolist(),
+            "display_step": "elapsed_MCS + 1; step 1 is initialization",
+            "error_bar": "observed minimum and maximum at selected MCS",
             "global_endorsement_update": "incremental_after_each_strategy_change",
             "reputation_update": "synchronous_at_MCS_end",
         }, handle, indent=2)
@@ -427,49 +405,74 @@ def save_outputs(output_dir, condition_stats, finalized, runtime_report,
 
         for index, mcs in enumerate(PLOT_TIMES):
             trajectory_rows.append({
-                "MCS": int(mcs), "beta": beta, "alpha": alpha,
+                "MCS": int(mcs), "display_step": int(mcs) + 1, "beta": beta, "alpha": alpha,
                 "mean_fc": state["mean"][index],
                 "std_fc": state["std"][index],
-                "ci95_low": state["ci_low"][index],
-                "ci95_high": state["ci_high"][index],
+                "min_fc": state["min_fc"][index],
+                "max_fc": state["max_fc"][index],
                 "runs": state["count"],
             })
 
         for index, mcs in enumerate(SNAPSHOT_TIMES):
             snapshot_rows.append({
-                "MCS": int(mcs), "beta": beta, "alpha": alpha,
+                "MCS": int(mcs), "display_step": int(mcs) + 1, "beta": beta, "alpha": alpha,
                 "mean_fc": state["snapshot_mean"][index],
                 "std_fc": state["snapshot_std"][index],
-                "bootstrap_ci95_low": state["bootstrap_low"][index],
-                "bootstrap_ci95_high": state["bootstrap_high"][index],
+                "min_fc": state["snapshot_min"][index],
+                "max_fc": state["snapshot_max"][index],
                 "runs": state["count"],
             })
 
     write_csv(output_dir / "runtime_by_condition.csv",
               ["beta", "alpha", "runs", "sum_run_seconds", "mean_run_seconds"],
               runtime_rows)
-    write_csv(output_dir / "mean_trajectory_ci.csv",
-              ["MCS", "beta", "alpha", "mean_fc", "std_fc",
-               "ci95_low", "ci95_high", "runs"], trajectory_rows)
+    write_csv(output_dir / "mean_trajectory_range.csv",
+              ["MCS", "display_step", "beta", "alpha", "mean_fc", "std_fc",
+               "min_fc", "max_fc", "runs"], trajectory_rows)
     write_csv(output_dir / "snapshot_statistics.csv",
-              ["MCS", "beta", "alpha", "mean_fc", "std_fc",
-               "bootstrap_ci95_low", "bootstrap_ci95_high", "runs"],
+              ["MCS", "display_step", "beta", "alpha", "mean_fc", "std_fc",
+               "min_fc", "max_fc", "runs"],
               snapshot_rows)
 
     # A compact text file in the original style, now with uncertainty columns.
-    with (output_dir / "mean_trajectory_with_uncertainty.txt").open(
+    with (output_dir / "mean_trajectory_with_range.txt").open(
             "w", encoding="utf-8") as handle:
-        handle.write("MCS\tBeta\tAlpha\tfc_mean\tfc_std\tCI95_low\tCI95_high\n")
+        handle.write("MCS\tDisplay_step\tBeta\tAlpha\tfc_mean\tfc_std\tfc_min\tfc_max\n")
         for row in trajectory_rows:
             handle.write(
-                f"{row['MCS']}\t{row['beta']:.2f}\t{row['alpha']:.2f}\t"
+                f"{row['MCS']}\t{row['display_step']}\t{row['beta']:.2f}\t{row['alpha']:.2f}\t"
                 f"{row['mean_fc']:.8f}\t{row['std_fc']:.8f}\t"
-                f"{row['ci95_low']:.8f}\t{row['ci95_high']:.8f}\n"
+                f"{row['min_fc']:.8f}\t{row['max_fc']:.8f}\n"
             )
 
 
-def plot_results(finalized, output_dir):
+def load_theory_curve(beta):
+    """Load the independently calculated curve; preserve its time convention."""
+    path = Path(__file__).resolve().parent / f"图3理论预测_alpha0.80_beta{beta:.2f}.csv"
+    if not path.is_file():
+        raise FileNotFoundError(f"Place the matching theory CSV beside fig3.py: {path}")
+    data = np.genfromtxt(path, delimiter=",", names=True, encoding="utf-8-sig")
+    data = np.atleast_1d(data)
+    required = {"MCS", "display_step", "pair_approximation_fc"}
+    if not required.issubset(data.dtype.names or ()):
+        raise ValueError(f"Theory CSV requires columns: {sorted(required)}")
+    times = data["MCS"]
+    steps = data["display_step"]
+    fc = data["pair_approximation_fc"]
+    if (len(data) < 2 or not np.isfinite(np.column_stack((times, steps, fc))).all()
+            or np.any(np.diff(times) <= 0) or np.any((fc < 0) | (fc > 1))
+            or not np.allclose(steps, times + 1)):
+        raise ValueError("Invalid theory times, display steps, or cooperator fractions.")
+    if times[0] != 0 or times[-1] < MCS_TOTAL:
+        raise ValueError("Theory CSV must cover initialization through MCS_TOTAL.")
+    keep = (times >= 0) & (times <= MCS_TOTAL)
+    return np.column_stack((steps[keep], fc[keep]))
+
+
+def plot_results(finalized, output_dir, theory=None):
     from matplotlib.colors import to_rgb
+    if theory is None:
+        theory = {beta: load_theory_curve(beta) for beta in BETA_VALUES}
     plt.rcParams["font.family"] = "serif"
     plt.rcParams["font.serif"] = ["Times New Roman"]
     plt.rcParams["mathtext.fontset"] = "stix"
@@ -481,79 +484,51 @@ def plot_results(finalized, output_dir):
 
     for panel, beta in enumerate(BETA_VALUES):
         ax = axes[panel]
+        ax.set_rasterization_zorder(2)
         for alpha_index, alpha in enumerate(ALPHA_VALUES):
             state = finalized[(panel, alpha_index)]
             color = colors[alpha_index]
-            # Preblend with white: same pale fill in PNG and EPS.
-            band_color = tuple(0.60 + 0.40 * c for c in to_rgb(color))
-            x = PLOT_TIMES
+            rgb = to_rgb(color)
+            band_color = tuple(0.86 + 0.14 * c for c in rgb)
+            # Display the initial state as step 1; retain elapsed MCS in exports.
+            x = PLOT_TIMES + 1
+            # The first plotted mean is the theoretical initial mean 0.5.
+            # Actual Bernoulli-start statistics remain in the CSV.
+            mean = state["mean"].copy()
+            if PLOT_TIMES[0] == 0:
+                mean[0] = INIT_COOP_RATE
 
-            # Use many logarithmically spaced points for a smooth mean
-            # trajectory. The shaded band is the pointwise 95% CI.
-            ax.fill_between(x, state["ci_low"], state["ci_high"],
-                            color=band_color, alpha=1.0, linewidth=0, zorder=1)
-            ax.plot(x, state["mean"], color=color, linewidth=1.0, zorder=3,
-                    label=rf"$\alpha = {alpha:.3f}$")
+            ax.fill_between(x, state["min_fc"], state["max_fc"],
+                            color=band_color, linewidth=0, zorder=1)
+            cloud = state["cloud_values"]
+            ax.scatter(np.broadcast_to(CLOUD_TIMES + 1, cloud.shape).ravel(),
+                       cloud.ravel(), s=3, c=[rgb], alpha=0.11,
+                       linewidths=0, zorder=1.5)
+            ax.plot(x, mean, color=color, linestyle="-",
+                    linewidth=1.0, zorder=3,
+                    label=rf"$\alpha = {alpha:.2f}$")
 
-            # Display the 95% bootstrap confidence interval at the same
-            # logarithmic time points.
-            snap_mean = state["snapshot_mean"]
-            snap_low = state["bootstrap_low"]
-            snap_high = state["bootstrap_high"]
-            yerr = np.vstack((snap_mean - snap_low, snap_high - snap_mean))
-            ax.errorbar(SNAPSHOT_TIMES, snap_mean, yerr=yerr,
-                        fmt="none", ecolor=color, elinewidth=0.8,
-                        capsize=2.0, alpha=0.65)
+            # Whiskers use the same observed extrema as the range band.
+            lower = state["snapshot_min"]
+            upper = state["snapshot_max"]
+            ax.errorbar(np.asarray(SNAPSHOT_TIMES) + 1, (lower + upper) / 2,
+                        yerr=(upper - lower) / 2, fmt="none",
+                        ecolor=color, elinewidth=0.8, capsize=2.0,
+                        zorder=2.5, label="_nolegend_")
 
-        # Show the true narrow CI at readable scale, without widening it.
-        # Only the existing alpha=0.80 late-time curve is enlarged.
-        zoom_index = ALPHA_VALUES.index(0.80)
-        zoom_state = finalized[(panel, zoom_index)]
-        zoom_color = colors[zoom_index]
-        zoom_band_color = tuple(0.60 + 0.40 * c for c in to_rgb(zoom_color))
-        late = np.asarray(x) >= MCS_TOTAL / 2.0
-        if np.count_nonzero(late) >= 2:
-            zoom = ax.inset_axes([0.53, 0.26, 0.43, 0.23], zorder=6)
-            zoom.fill_between(
-                np.asarray(x)[late], zoom_state["ci_low"][late],
-                zoom_state["ci_high"][late], color=zoom_band_color,
-                alpha=1.0, linewidth=0, zorder=1)
-            zoom.plot(np.asarray(x)[late], zoom_state["mean"][late],
-                      color=zoom_color, linewidth=0.8, zorder=3)
-            snap_t = np.asarray(SNAPSHOT_TIMES)
-            late_snap = snap_t >= np.asarray(x)[late][0]
-            zoom_mean = zoom_state["snapshot_mean"][late_snap]
-            zoom_yerr = np.vstack((
-                zoom_mean - zoom_state["bootstrap_low"][late_snap],
-                zoom_state["bootstrap_high"][late_snap] - zoom_mean))
-            zoom.errorbar(snap_t[late_snap], zoom_mean, yerr=zoom_yerr,
-                          fmt="none", ecolor=zoom_color, elinewidth=1.0,
-                          capsize=3.0, capthick=1.0, alpha=1.0, zorder=5)
-            lower = float(np.min(zoom_state["ci_low"][late]))
-            upper = float(np.max(zoom_state["ci_high"][late]))
-            if np.any(late_snap):
-                lower = min(lower, float(np.min(
-                    zoom_state["bootstrap_low"][late_snap])))
-                upper = max(upper, float(np.max(
-                    zoom_state["bootstrap_high"][late_snap])))
-            padding = max((upper - lower) * 0.15, 1e-5)
-            zoom.set_ylim(max(0.0, lower - padding),
-                          min(1.0, upper + padding))
-            zoom.set_xscale("log")
-            zoom.set_xlim(np.asarray(x)[late][0] / 1.02, x[-1] * 1.02)
-            zoom.set_xticks([np.asarray(x)[late][0], x[-1]])
-            zoom.set_xticklabels([str(int(np.asarray(x)[late][0])),
-                                  str(int(x[-1]))])
-            zoom.minorticks_off()
-            zoom.locator_params(axis="y", nbins=3)
-            zoom.ticklabel_format(axis="y", style="plain", useOffset=False)
-            zoom.tick_params(direction="in", labelsize=7, top=True,
-                             right=True, length=2)
-            zoom.set_title(r"$\alpha=0.80$: late-time zoom", fontsize=8,
-                           pad=3)
+        # Independently computed alpha=0.80 theory for this panel's beta.
+        curve = theory[beta]
+        ax.plot(curve[:, 0], curve[:, 1], color="black", linestyle="-",
+                linewidth=1.0, zorder=4,
+                label=r"$\alpha=0.80$ (Theory)")
 
         ax.set_xscale("log")
-        ax.set_xlim(1, MCS_TOTAL)
+        ax.set_xlim(1, MCS_TOTAL + 1)
+        major_steps = [1, 10, 100, 1000, 10000]
+        major_steps = [step for step in major_steps if step <= MCS_TOTAL + 1]
+        ax.set_xticks(major_steps)
+        ax.xaxis.set_major_formatter(LogFormatterMathtext(base=10, labelOnlyBase=True))
+        ax.xaxis.set_minor_formatter(NullFormatter())
         # Make f_c=0 and f_c=1 coincide exactly with the plot boundaries.
         ax.set_ylim(0.0, 1.0)
         ax.margins(y=0.0)
@@ -561,18 +536,25 @@ def plot_results(finalized, output_dir):
         ax.tick_params(direction="in", which="both", top=True, right=True,
                        labelsize=14)
         ax.set_ylabel(r"$f_c$", fontsize=16, fontstyle="italic")
-        ax.set_xlabel(r"$MCS$", fontsize=16, fontstyle="italic")
+        ax.set_xlabel(r"$MCS$", fontsize=16)
         ax.text(0.04, 0.92, sub_labels[panel], transform=ax.transAxes,
                 fontsize=16, fontweight="bold")
-        ax.text(0.96, 0.08, rf"$\beta = {beta:.3f}$",
+        ax.text(0.96, 0.08, rf"$\beta = {beta:.2f}$",
                 transform=ax.transAxes, fontsize=14, fontstyle="italic",
                 ha="right", va="bottom")
 
         # ====================== 修改在这里 ======================
+        handles, labels = ax.get_legend_handles_labels()
+        # Put the theory entry immediately below the matching simulation entry.
+        order = list(range(len(handles) - 1))
+        alpha_index = next(k for k, a in enumerate(ALPHA_VALUES) if np.isclose(a, 0.80))
+        order.insert(alpha_index + 1, len(handles) - 1)
         legend = ax.legend(
+            [handles[k] for k in order], [labels[k] for k in order],
             loc="upper right",
             bbox_to_anchor=(1.0, 0.90),
             frameon=True,
+            framealpha=1.0,
             fontsize=12,
             labelspacing=0.2
         )
@@ -583,10 +565,10 @@ def plot_results(finalized, output_dir):
     plt.tight_layout()
     plt.subplots_adjust(left=0.08, wspace=0.2, hspace=0.25)
     # ========== 修改点：同时输出 PNG + EPS ==========
-    png_path = output_dir / f"3581Final_Evolution_u{MUTATION_RATE}_Fig3Style_CI.png"
-    eps_path = output_dir / f"3581Final_Evolution_u{MUTATION_RATE}_Fig3Style_CI.eps"
+    png_path = output_dir / f"3581Final_Evolution_u{MUTATION_RATE}_Fig3Style_Cloud.png"
+    eps_path = output_dir / f"3581Final_Evolution_u{MUTATION_RATE}_Fig3Style_Cloud.eps"
     plt.savefig(png_path, dpi=300, bbox_inches="tight")
-    plt.savefig(eps_path, bbox_inches="tight")
+    plt.savefig(eps_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return png_path, eps_path
 
@@ -594,13 +576,13 @@ def plot_results(finalized, output_dir):
 # ============================================================
 # 5. Main program
 # ============================================================
-PLOT_TIMES = np.unique(np.concatenate([
-    np.geomspace(1, MCS_TOTAL, PLOT_POINT_COUNT).round().astype(np.int64),
-    np.asarray(SNAPSHOT_TIMES, dtype=np.int64),
-])).astype(np.int64)
+PLOT_TIMES = np.arange(MCS_TOTAL + 1, dtype=np.int64)
+# Draw run-level dots at selected display times; the envelope uses every MCS.
+CLOUD_TIMES = np.unique(np.r_[0, np.geomspace(1, MCS_TOTAL, 180).round().astype(np.int64)])
 
 
 def main():
+    theory = {beta: load_theory_curve(beta) for beta in BETA_VALUES}
     # Compile once in the parent so a compilation error fails promptly,
     # rather than repeatedly restarting failed Pool initializer processes.
     if MCS_TOTAL < 2 or NUM_RUNS < 2 or N != L * L:
@@ -627,6 +609,9 @@ def main():
                 "count": 0,
                 "mean": np.zeros(PLOT_TIMES.size, dtype=np.float64),
                 "m2": np.zeros(PLOT_TIMES.size, dtype=np.float64),
+                "min_fc": np.full(PLOT_TIMES.size, np.inf),
+                "max_fc": np.full(PLOT_TIMES.size, -np.inf),
+                "cloud_values": [],
                 "snapshot_values": [],
                 "runtime_seconds": 0.0,
             }
@@ -657,6 +642,9 @@ def main():
             delta = values - state["mean"]
             state["mean"] += delta / count
             state["m2"] += delta * (values - state["mean"])
+            np.minimum(state["min_fc"], values, out=state["min_fc"])
+            np.maximum(state["max_fc"], values, out=state["max_fc"])
+            state["cloud_values"].append(result["trajectory"][CLOUD_TIMES])
             state["snapshot_values"].append(
                 result["trajectory"][np.asarray(SNAPSHOT_TIMES, dtype=np.int64)]
             )
@@ -696,13 +684,13 @@ def main():
 
     save_outputs(output_dir, condition_stats, finalized, runtime_report,
                  convergence_rows, seed_rows)
-    png_fig, eps_fig = plot_results(finalized, output_dir)
+    png_fig, eps_fig = plot_results(finalized, output_dir, theory=theory)
 
     print(f"总计耗时: {total_elapsed:.2f} s")
     print(f"结果目录: {output_dir.resolve()}")
     print(f"PNG图像文件: {png_fig.resolve()}")
     print(f"EPS矢量图像文件: {eps_fig.resolve()}")
-    print("阴影: 均值的逐点95% Student-t区间；误差棒: 快照均值的95% bootstrap percentile区间")
+    print("主图: 第1个记录步为初始理论均值 0.5；记录步 = 实际MCS + 1；散点为实际运行样本，浅色外沿为逐 MCS 最小值至最大值")
     print(f"收敛判据: 相邻两个 {CONVERGENCE_WINDOW} MCS 窗口均值差的绝对值 <= {CONVERGENCE_TOL}")
 
 

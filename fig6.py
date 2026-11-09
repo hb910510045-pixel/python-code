@@ -1,13 +1,8 @@
-# Updating protocol fixed to the manuscript; historical results require recomputation.
-from model_rules import (mcs_fixed, mcs_csr, mcs_square, periodic_neighbors,
-                         PROTOCOL_ID, prepare_run_directory)
 # -*- coding: utf-8 -*-
-"""Figure 6 with pointwise 95% percentile-bootstrap confidence intervals.
+"""Figure 6: mean cooperator fractions with the original lines and markers.
 
-The four original Numba functions and production parameters are preserved.
-Run averages, seeds, SD, SEM, confidence limits and settings are exported.
-Run normally in PyCharm, or use --plot-only with a saved raw-runs NPZ file.
-Dependencies: numpy, numba, matplotlib, tqdm (no scipy dependency).
+Each mean is calculated from the independent runs' late-window averages. Use --plot-only with a saved figure6_raw_runs.npz to replot.
+Dependencies: numpy, numba, matplotlib, tqdm.
 """
 import os
 
@@ -42,8 +37,8 @@ FIXED_U = 0.00
 
 # 在 GAMMA_VALUES 中增加了 1.00
 GAMMA_VALUES = [0.00, 0.05, 0.10, 0.20, 1.00]
-# 将 b 的区间调整为 [1.0, 6.0]，取 101 个点（保持步长 0.05）
-B_VALUES = np.linspace(1.0, 6.0, 101)
+# b 的区间为 [1.0, 5.0]，取 81 个点（保持步长 0.05）
+B_VALUES = np.linspace(1.0, 5.0, 81)
 BASE_SEED = 20261007  # 固定基础种子以便复现
 
 
@@ -52,6 +47,119 @@ BASE_SEED = 20261007  # 固定基础种子以便复现
 # ==========================================
 
 # 2. 解决 JIT 缓存缺失问题：使用 @njit(cache=True)
+# Model update functions used by Figure 6.
+PROTOCOL_ID = 'replacement_current_global_end_mcs_ema_v1'
+
+
+@njit(cache=True)
+def current_weights(strategies, reputations, epsilon):
+    total, cooperative = 0.0, 0.0
+    for x in range(len(strategies)):
+        weight = reputations[x] + epsilon
+        total += weight
+        if strategies[x] == 1:
+            cooperative += weight
+    return total, cooperative
+
+
+@njit(cache=True)
+def fermi_probability(focal_fitness, neighbor_fitness, noise):
+    # Stable logistic: no hard truncation of finite probabilities.
+    exponent = (focal_fitness - neighbor_fitness) / noise
+    if exponent >= 0.0:
+        value = np.exp(-exponent)
+        return value / (1.0 + value)
+    return 1.0 / (1.0 + np.exp(exponent))
+
+
+@njit(cache=True)
+def fixed_fitness(x, strategies, reputations, neighbors, total, cooperative,
+                  alpha, beta, epsilon, reward, sucker, temptation, punishment):
+    strategy = strategies[x]
+    numerator = reputations[x] + epsilon
+    denominator = numerator
+    payoff = 0.0
+    for edge in range(neighbors.shape[1]):
+        y = neighbors[x, edge]
+        weight = reputations[y] + epsilon
+        denominator += weight
+        if strategies[y] == strategy:
+            numerator += weight
+        if strategy == 1:
+            payoff += reward if strategies[y] == 1 else sucker
+        else:
+            payoff += temptation if strategies[y] == 1 else punishment
+    if beta == 0.0:
+        return payoff
+    # Only remove roundoff outside [0,1], not genuine small support.
+    global_c = min(1.0, max(0.0, cooperative / total))
+    support = alpha * numerator / denominator + (1.0 - alpha) * (
+        global_c if strategy == 1 else 1.0 - global_c)
+    return payoff * support ** beta
+
+
+@njit(cache=True)
+def fixed_event(x, strategies, reputations, neighbors, total, cooperative,
+                noise, alpha, beta, epsilon, u, reward, sucker, temptation, punishment):
+    old = strategies[x]
+    new = old
+    if np.random.random() < u:
+        new = np.random.randint(0, 2)
+    else:
+        y = neighbors[x, np.random.randint(0, neighbors.shape[1])]
+        if old != strategies[y]:
+            focal = fixed_fitness(x, strategies, reputations, neighbors, total,
+                                  cooperative, alpha, beta, epsilon,
+                                  reward, sucker, temptation, punishment)
+            target = fixed_fitness(y, strategies, reputations, neighbors, total,
+                                   cooperative, alpha, beta, epsilon,
+                                   reward, sucker, temptation, punishment)
+            if np.random.random() < fermi_probability(focal, target, noise):
+                new = strategies[y]
+    if new != old:
+        strategies[x] = new
+        cooperative += (reputations[x] + epsilon) * (new - old)
+    return cooperative
+
+
+@njit(cache=True)
+def mcs_fixed(strategies, reputations, neighbors, noise, b, alpha, beta,
+              gamma, epsilon, u, reward=1.0, sucker=0.0, punishment=0.0):
+    total, cooperative = current_weights(strategies, reputations, epsilon)
+    for _ in range(len(strategies)):
+        x = np.random.randint(0, len(strategies))
+        cooperative = fixed_event(x, strategies, reputations, neighbors,
+                                  total, cooperative, noise, alpha, beta,
+                                  epsilon, u, reward, sucker, b, punishment)
+    for x in range(len(strategies)):
+        reputations[x] = (1.0 - gamma) * reputations[x] + gamma * strategies[x]
+
+
+def prepare_run_directory(script_path, parameters=None):
+    """Keep new relative outputs separate from all historical result files."""
+    from pathlib import Path
+    from datetime import datetime
+    import os, json, hashlib, platform, sys
+    import numba
+    script = Path(script_path).resolve()
+    root = script.parent / ('results_' + PROTOCOL_ID)
+    output = root / ('run_' + datetime.now().strftime('%Y%m%d_%H%M%S_%f'))
+    output.mkdir(parents=True, exist_ok=False)
+    manifest = dict(protocol=PROTOCOL_ID, source=str(script), arguments=sys.argv[1:],
+                    source_sha256=hashlib.sha256(script.read_bytes()).hexdigest(),
+                    core_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                    python=platform.python_version(), numpy=np.__version__, numba=numba.__version__)
+    if parameters is not None:
+        captured = {}
+        for name, value in parameters.items():
+            if name.isupper() and isinstance(value, (str, int, float, bool, list, tuple, Path, np.ndarray)):
+                captured[name] = value.tolist() if isinstance(value, np.ndarray) else str(value) if isinstance(value, Path) else value
+        manifest['script_defaults'] = captured
+    (output / 'protocol_manifest.json').write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+    return output
+
+
 @njit(cache=True)
 def build_neighbor_map(L):
     """ 构建 von Neumann 邻域 (上下左右) """
@@ -129,11 +237,7 @@ import csv
 import json
 
 CPU_FRACTION = 0.60
-CONFIDENCE_LEVEL = 0.95
-BOOTSTRAP_RESAMPLES = 10000
-BOOTSTRAP_BATCH = 500
-BOOTSTRAP_SEED_NAMESPACE = 610061
-OUTPUT_ROOT = Path(__file__).resolve().parent / "figure6_uncertainty_results_current_protocol"
+OUTPUT_ROOT = Path(__file__).resolve().parent / "figure6_mean_results"
 
 _WORKER_CONFIG = None
 _WORKER_NEIGHBORS = None
@@ -272,37 +376,7 @@ def simulate(config, workers, output_dir):
 # ==========================================
 # 4. Confidence intervals across independent runs
 # ==========================================
-def bootstrap_mean_ci(values, rng, n_resamples=BOOTSTRAP_RESAMPLES,
-                      confidence=CONFIDENCE_LEVEL, batch=BOOTSTRAP_BATCH):
-    """Pointwise percentile-bootstrap CI for the mean of RUN averages.
-
-    Do not pass the 3000 correlated time points from one run here.
-    No normality assumption is imposed on the distribution of run averages.
-    This is an approximate bootstrap interval, not a simultaneous confidence band.
-    Identical observations produce a zero-width empirical interval.
-    """
-    values = np.asarray(values, dtype=np.float64)
-    if values.ndim != 1 or len(values) < 2 or not np.all(np.isfinite(values)):
-        raise ValueError("Need at least two finite independent run averages.")
-    if n_resamples < 1000 or batch < 1 or not 0 < confidence < 1:
-        raise ValueError("Use >= 1000 resamples, batch >= 1 and 0 < confidence < 1.")
-    if np.any(values < 0.0) or np.any(values > 1.0):
-        raise ValueError("Cooperator fractions must lie in [0, 1].")
-    if np.all(values == values[0]):
-        return float(values[0]), float(values[0])
-    resampled_means = np.empty(n_resamples, dtype=np.float64)
-    for start in range(0, n_resamples, batch):
-        stop = min(start + batch, n_resamples)
-        indices = rng.integers(0, len(values), size=(stop - start, len(values)), dtype=np.int32)
-        resampled_means[start:stop] = np.mean(values[indices], axis=1)
-    tail_percent = 100.0 * (1.0 - confidence) / 2.0
-    lower, upper = np.percentile(
-        resampled_means, [tail_percent, 100.0 - tail_percent], method="linear",
-    )
-    return float(lower), float(upper)
-
-
-def summarize(run_values, config, n_resamples=BOOTSTRAP_RESAMPLES, progress=True):
+def summarize(run_values, config):
     validate_config(config)
     run_values = np.asarray(run_values, dtype=np.float64)
     expected_shape = (len(config["GAMMA_VALUES"]), len(config["B_VALUES"]), config["NUM_RUNS"])
@@ -311,31 +385,11 @@ def summarize(run_values, config, n_resamples=BOOTSTRAP_RESAMPLES, progress=True
     if np.any(run_values < 0.0) or np.any(run_values > 1.0):
         raise ValueError("Raw cooperation averages lie outside [0, 1].")
     mean = np.mean(run_values, axis=2)  # Same average as the original code.
-    sd = np.std(run_values, axis=2, ddof=1)
-    sem = sd / np.sqrt(config["NUM_RUNS"])
-    low = np.empty_like(mean)
-    high = np.empty_like(mean)
-    identical = np.all(run_values == run_values[:, :, :1], axis=2)
-    for g_idx, b_idx in tqdm(
-        np.ndindex(mean.shape), total=mean.size,
-        desc="Pointwise bootstrap CIs", unit="point", disable=not progress,
-    ):
-        # A separate RNG makes statistical resampling independent of simulation RNGs.
-        ci_seed = np.random.SeedSequence([
-            config["BASE_SEED"], BOOTSTRAP_SEED_NAMESPACE, g_idx, b_idx,
-        ])
-        low[g_idx, b_idx], high[g_idx, b_idx] = bootstrap_mean_ci(
-            run_values[g_idx, b_idx], np.random.default_rng(ci_seed), n_resamples=n_resamples,
-        )
-    return {
-        "mean": mean, "sd": sd, "sem": sem,
-        "ci95_lower": low, "ci95_upper": high,
-        "identical_runs": identical,
-    }
+    return {"mean": mean}
 
 
-def export_results(run_values, seeds, config, stats, output_dir,
-                   n_resamples=BOOTSTRAP_RESAMPLES):
+
+def export_results(run_values, seeds, config, stats, output_dir):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     gamma_values = config["GAMMA_VALUES"]
@@ -353,16 +407,13 @@ def export_results(run_values, seeds, config, stats, output_dir,
     with (output_dir / "figure6_statistics.csv").open("w", encoding="utf-8", newline="") as stream:
         writer = csv.writer(stream)
         writer.writerow([
-            "gamma", "b", "n_runs", "mean_fc", "sd_across_runs", "sem",
-            "ci95_lower", "ci95_upper", "all_run_averages_identical",
+            "gamma", "b", "n_runs", "mean_fc",
         ])
         for g_idx, gamma in enumerate(gamma_values):
             for b_idx, b in enumerate(b_values):
                 writer.writerow([
                     gamma, b, config["NUM_RUNS"],
-                    *[float(stats[key][g_idx, b_idx]) for key in
-                      ("mean", "sd", "sem", "ci95_lower", "ci95_upper")],
-                    bool(stats["identical_runs"][g_idx, b_idx]),
+                    float(stats["mean"][g_idx, b_idx]),
                 ])
     # Preserve the original three-column mean-data format as a separate file.
     rows = [[gamma, b, stats["mean"][g_idx, b_idx]]
@@ -375,14 +426,7 @@ def export_results(run_values, seeds, config, stats, output_dir,
     )
     metadata = dict(config)
     metadata.update({
-        "error_bar": "pointwise 95% percentile-bootstrap CI of the mean across run averages",
-        "confidence_level": CONFIDENCE_LEVEL,
-        "bootstrap_resamples": int(n_resamples),
-        "bootstrap_seed_namespace": BOOTSTRAP_SEED_NAMESPACE,
         "sample_unit": "one independent realization's late-window time average",
-        "intervals_are_simultaneous": False,
-        "normality_assumption_for_run_averages": False,
-        "all_identical_parameter_points": int(np.count_nonzero(stats["identical_runs"])),
         "updating_protocol": [
             "independent uniform focal sampling with replacement: N events per MCS",
             "global endorsement follows current strategies after each strategy change",
@@ -390,12 +434,7 @@ def export_results(run_values, seeds, config, stats, output_dir,
             "synchronous reputation update at the end of each MCS",
             "original absorbing-configuration early return applies only when u=0",
         ],
-        "interpretation": (
-            "Intervals quantify observed variation in the estimated mean across independent runs. "
-            "They are not SD bars, not a simultaneous band, and not proof of statistical significance. "
-            "An identical set of run averages gives a zero-width empirical interval; this does not "
-            "establish absence of rare outcomes or of convergence/finite-size effects."
-        ),
+        "interpretation": "Lines and markers show the ensemble mean of independent late-window averages.",
     })
     (output_dir / "figure6_settings.json").write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8",
@@ -404,22 +443,35 @@ def export_results(run_values, seeds, config, stats, output_dir,
     caption = (
         f"Each point shows the mean cooperator fraction over {config['NUM_RUNS']} independent "
         f"realizations, with each realization averaged over the final {window} MCS of "
-        f"{config['MCS_TOTAL']} MCS. Error bars indicate pointwise 95% percentile-bootstrap "
-        f"confidence intervals for the mean, calculated from {n_resamples} resamples of the "
-        "independent realization averages. No curve smoothing is applied. Intervals narrower "
-        "than the markers may not be visible; identical realization averages give zero-width intervals."
+        f"{config['MCS_TOTAL']} MCS. Lines connect the means at adjacent sampled b values."
     )
     (output_dir / "figure6_caption_en.txt").write_text(caption + "\n", encoding="utf-8")
     (output_dir / "figure6_caption_en.tex").write_text(
         caption.replace("%", r"\%") + "\n", encoding="utf-8",
     )
-    print(f"Points with identical run averages: {np.count_nonzero(stats['identical_runs'])}/{stats['mean'].size}")
 
 
 # ==========================================
-# 5. Original curve style plus confidence bars
+# 5. Original mean-curve style
 # ==========================================
-def plot_figure(config, stats, output_dir, show=False):
+def load_theory_curve():
+    """Read the equation-based prediction beside this script."""
+    path = Path(__file__).resolve().parent / "图6理论预测.csv"
+    if not path.is_file():
+        raise FileNotFoundError(f"请将图6理论预测.csv与本脚本放在同一文件夹：{path}")
+    data = np.loadtxt(path, delimiter=",", skiprows=1,
+                      encoding="utf-8-sig", ndmin=2)
+    if data.shape[1] != 2 or len(data) < 2 or not np.all(np.isfinite(data)):
+        raise ValueError("理论CSV须包含两列有限数值：b、pair_approximation_fc。")
+    data = data[np.argsort(data[:, 0], kind="stable")]
+    if np.any(np.diff(data[:, 0]) <= 0):
+        raise ValueError("理论CSV中的b值必须互不重复。")
+    if np.any((data[:, 1] < 0) | (data[:, 1] > 1)):
+        raise ValueError("理论合作比例必须位于[0, 1]。")
+    return data
+
+
+def plot_figure(config, stats, output_dir, show=False, theory=None):
     import matplotlib.pyplot as plt
     plt.rcParams["font.family"] = "serif"
     plt.rcParams["mathtext.fontset"] = "cm"
@@ -430,38 +482,37 @@ def plot_figure(config, stats, output_dir, show=False):
     for j, gamma in enumerate(config["GAMMA_VALUES"]):
         color = colors[j % len(colors)]
         marker = markers[j % len(markers)]
-        lower = stats["ci95_lower"][j]
-        upper = stats["ci95_upper"][j]
-        # Draw the interval itself, then place mean markers separately.
-        # This also supports asymmetric intervals without clipping endpoints.
-        ax.errorbar(
-            b_values, (lower + upper) / 2.0, yerr=(upper - lower) / 2.0,
-            fmt="none", ecolor=color, elinewidth=0.85,
-            capsize=2.0, capthick=0.85, zorder=2, label="_nolegend_",
-        )
-        ax.plot(
-            b_values, stats["mean"][j], label=rf"$\gamma={gamma:.2f}$",
-            color=color, marker=marker, markersize=8 if marker == "*" else 6,
-            linewidth=1.2, markeredgecolor=color,
-            markerfacecolor="none" if color == "#0000CD" else color, zorder=3,
-        )
+        ax.plot(b_values, stats["mean"][j], label=rf"$\gamma={gamma:.2f}$",
+                color=color, linestyle="-", marker=marker,
+                markersize=8 if marker == "*" else 6,
+                linewidth=1.2, markeredgecolor=color,
+                markerfacecolor="none" if color == "#0000CD" else color,
+                zorder=3)
+    if theory is None:
+        theory = load_theory_curve()
+    ax.plot(theory[:, 0], theory[:, 1],
+            color="black", linestyle="-", marker="s", markersize=6,
+            linewidth=1.2, markeredgecolor="black", markerfacecolor="black",
+            label=r"$\gamma=1$ (Theory)", zorder=4)
+
     ax.set_ylim(0, 1.0)
     ax.set_yticks([0, 0.2, 0.4, 0.6, 0.8, 1.0])
     ax.set_yticklabels(["0", "0.2", "0.4", "0.6", "0.8", "1"])
-    ax.set_xlim(1.0, 6.0)
-    ax.set_xticks([1, 2, 3, 4, 5, 6])
-    ax.set_xticklabels(["1", "2", "3", "4", "5", "6"])
+    ax.set_xlim(1.0, 5.0)
+    ax.set_xticks([1, 2, 3, 4, 5])
+    ax.set_xticklabels(["1", "2", "3", "4", "5"])
     ax.margins(0)
     ax.tick_params(direction="in", which="both", top=True, right=True, labelsize=12)
     ax.set_xlabel(r"$b$", fontsize=14)
     ax.set_ylabel(r"$f_c$", fontsize=14)
     ax.legend(
-        fontsize=10, frameon=True, framealpha=1.0, edgecolor="black",
-        loc="upper right", bbox_to_anchor=(0.85, 0.96), handlelength=1.5,
+        fontsize=12, frameon=True, framealpha=1.0, edgecolor="black",
+        loc="lower center", bbox_to_anchor=(0.56, 0.06), ncol=1,
+        handlelength=1.5, labelspacing=0.45, borderpad=0.55,
     )
     fig.tight_layout()
     output_dir = Path(output_dir)
-    for extension in ("png", "eps", "pdf"):
+    for extension in ("png", "eps"):
         path = output_dir / f"figure6.{extension}"
         fig.savefig(path, dpi=600, bbox_inches="tight", format=extension)
         print(f"Saved: {path}")
@@ -472,16 +523,17 @@ def plot_figure(config, stats, output_dir, show=False):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Figure 6: current-state replacement-sampling simulations with confidence intervals across independent runs.",
+        description="Figure 6: current-state replacement-sampling simulations and mean cooperation curves across independent runs.",
     )
     parser.add_argument("--plot-only", type=Path, help="Replot an existing figure6_raw_runs.npz without simulations.")
     parser.add_argument("--output-dir", type=Path, help="Explicit directory for this run's outputs.")
     parser.add_argument("--workers", type=int, default=max(1, int((mp.cpu_count() or 1) * CPU_FRACTION)))
-    parser.add_argument("--bootstrap-resamples", type=int, default=BOOTSTRAP_RESAMPLES)
     parser.add_argument("--show", action="store_true", help="Also display the figure after saving.")
     args = parser.parse_args()
-    if args.workers < 1 or args.bootstrap_resamples < 1000:
-        parser.error("workers must be >= 1 and bootstrap-resamples must be >= 1000")
+    if args.workers < 1:
+        parser.error("workers must be >= 1")
+    # Check the theory file before starting the simulation workload.
+    theory = load_theory_curve()
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     output_dir = args.output_dir or OUTPUT_ROOT / ("replot_" if args.plot_only else "run_") / stamp
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -491,9 +543,9 @@ def main():
     else:
         config = default_config()
         run_values, seeds = simulate(config, args.workers, output_dir)
-    stats = summarize(run_values, config, n_resamples=args.bootstrap_resamples)
-    export_results(run_values, seeds, config, stats, output_dir, args.bootstrap_resamples)
-    plot_figure(config, stats, output_dir, show=args.show)
+    stats = summarize(run_values, config)
+    export_results(run_values, seeds, config, stats, output_dir)
+    plot_figure(config, stats, output_dir, show=args.show, theory=theory)
     print(f"Finished. Output directory: {output_dir.resolve()}")
 
 

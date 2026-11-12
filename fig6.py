@@ -26,8 +26,8 @@ N = L * L
 K = 0.1  # 费米公式中的噪声 K
 EPSILON = 0.01  # 正则化常数 epsilon
 
-MCS_TOTAL = 20000  # 模拟总步数
-MCS_TRANSIENT = 17000  # 暂态步数
+MCS_TOTAL = 20000 # 模拟总步数
+MCS_TRANSIENT = 17000 # 暂态步数
 NUM_RUNS = 100  # 独立运行次数
 
 # 固定 alpha, beta 和 u。横坐标保留为 b，图例的多条线改为不同的 gamma
@@ -35,8 +35,7 @@ FIXED_ALPHA = 0.80
 FIXED_BETA = 0.50
 FIXED_U = 0.00
 
-# 在 GAMMA_VALUES 中增加了 1.00
-GAMMA_VALUES = [0.00, 0.05, 0.10, 0.20, 1.00]
+GAMMA_VALUES = [0.00, 0.10, 0.20, 0.50, 1.00]
 # b 的区间为 [1.0, 5.0]，取 81 个点（保持步长 0.05）
 B_VALUES = np.linspace(1.0, 5.0, 81)
 BASE_SEED = 20261007  # 固定基础种子以便复现
@@ -454,19 +453,25 @@ def export_results(run_values, seeds, config, stats, output_dir):
 # ==========================================
 # 5. Original mean-curve style
 # ==========================================
-def load_theory_curve():
-    """Read the equation-based prediction beside this script."""
-    path = Path(__file__).resolve().parent / "图6理论预测.csv"
+def load_theory_curves(gamma_values):
+    """Read the predictions in the same gamma order as the simulation."""
+    path = Path(__file__).resolve().parent / "图6理论预测_含γ0.50.csv"
     if not path.is_file():
-        raise FileNotFoundError(f"请将图6理论预测.csv与本脚本放在同一文件夹：{path}")
-    data = np.loadtxt(path, delimiter=",", skiprows=1,
-                      encoding="utf-8-sig", ndmin=2)
-    if data.shape[1] != 2 or len(data) < 2 or not np.all(np.isfinite(data)):
-        raise ValueError("理论CSV须包含两列有限数值：b、pair_approximation_fc。")
+        raise FileNotFoundError(f"请将理论CSV与本脚本放在同一文件夹：{path}")
+    columns = ["b", *(f"pair_approximation_fc_gamma_{gamma:.2f}" for gamma in gamma_values)]
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        header = next(csv.reader(handle), [])
+        missing = set(columns) - set(header)
+        if missing:
+            raise ValueError(f"理论CSV缺少列：{sorted(missing)}")
+        data = np.loadtxt(handle, delimiter=",", ndmin=2,
+                          usecols=[header.index(column) for column in columns])
+    if len(data) < 2 or not np.all(np.isfinite(data)):
+        raise ValueError("理论CSV须包含至少两行有限数值。")
     data = data[np.argsort(data[:, 0], kind="stable")]
     if np.any(np.diff(data[:, 0]) <= 0):
         raise ValueError("理论CSV中的b值必须互不重复。")
-    if np.any((data[:, 1] < 0) | (data[:, 1] > 1)):
+    if np.any((data[:, 1:] < 0) | (data[:, 1:] > 1)):
         raise ValueError("理论合作比例必须位于[0, 1]。")
     return data
 
@@ -475,25 +480,29 @@ def plot_figure(config, stats, output_dir, show=False, theory=None):
     import matplotlib.pyplot as plt
     plt.rcParams["font.family"] = "serif"
     plt.rcParams["mathtext.fontset"] = "cm"
-    colors = ["#e4d00a", "#00ced1", "#0000CD", "#DC143C", "#228B22", "#800080"]
-    markers = ["*", "+", "o", "o", "s", "^"]
+    styles = {
+        "0.00": ("#e4d00a", "*", (0, (5, 2))),
+        "0.05": ("#00ced1", "+", (0, (1, 1.5))),
+        "0.10": ("#0000CD", "o", (0, (5, 2, 1, 2))),
+        "0.20": ("#DC143C", "o", (0, (5, 2, 1, 2, 1, 2))),
+        "0.50": ("#00ced1", "+", (0, (1, 1.5))),
+        "1.00": ("#228B22", "s", (0, (8, 3))),
+    }
+    if theory is None:
+        theory = load_theory_curves(config["GAMMA_VALUES"])
     b_values = np.asarray(config["B_VALUES"], dtype=np.float64)
     fig, ax = plt.subplots(figsize=(5, 4.5))
     for j, gamma in enumerate(config["GAMMA_VALUES"]):
-        color = colors[j % len(colors)]
-        marker = markers[j % len(markers)]
+        color, marker, theory_style = styles[f"{gamma:.2f}"]
         ax.plot(b_values, stats["mean"][j], label=rf"$\gamma={gamma:.2f}$",
                 color=color, linestyle="-", marker=marker,
                 markersize=8 if marker == "*" else 6,
                 linewidth=1.2, markeredgecolor=color,
                 markerfacecolor="none" if color == "#0000CD" else color,
                 zorder=3)
-    if theory is None:
-        theory = load_theory_curve()
-    ax.plot(theory[:, 0], theory[:, 1],
-            color="black", linestyle="-", marker="s", markersize=6,
-            linewidth=1.2, markeredgecolor="black", markerfacecolor="black",
-            label=r"$\gamma=1$ (Theory)", zorder=4)
+        ax.plot(theory[:, 0], theory[:, j + 1],
+                color=color, linestyle=theory_style, linewidth=1.2,
+                label=rf"$\gamma={gamma:.2f}$ (Theory)", zorder=4)
 
     ax.set_ylim(0, 1.0)
     ax.set_yticks([0, 0.2, 0.4, 0.6, 0.8, 1.0])
@@ -506,9 +515,9 @@ def plot_figure(config, stats, output_dir, show=False, theory=None):
     ax.set_xlabel(r"$b$", fontsize=14)
     ax.set_ylabel(r"$f_c$", fontsize=14)
     ax.legend(
-        fontsize=12, frameon=True, framealpha=1.0, edgecolor="black",
-        loc="lower center", bbox_to_anchor=(0.56, 0.06), ncol=1,
-        handlelength=1.5, labelspacing=0.45, borderpad=0.55,
+        fontsize=9, frameon=True, framealpha=1.0, edgecolor="black",
+        loc="lower center", bbox_to_anchor=(0.63, 0.06), ncol=1,
+        handlelength=2.4, handletextpad=0.50, labelspacing=0.40, borderpad=0.35,
     )
     fig.tight_layout()
     output_dir = Path(output_dir)
@@ -532,8 +541,6 @@ def main():
     args = parser.parse_args()
     if args.workers < 1:
         parser.error("workers must be >= 1")
-    # Check the theory file before starting the simulation workload.
-    theory = load_theory_curve()
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     output_dir = args.output_dir or OUTPUT_ROOT / ("replot_" if args.plot_only else "run_") / stamp
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -542,6 +549,8 @@ def main():
         print(f"Replotting: {args.plot_only.resolve()}")
     else:
         config = default_config()
+    theory = load_theory_curves(config["GAMMA_VALUES"])
+    if not args.plot_only:
         run_values, seeds = simulate(config, args.workers, output_dir)
     stats = summarize(run_values, config)
     export_results(run_values, seeds, config, stats, output_dir)

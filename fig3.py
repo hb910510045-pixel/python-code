@@ -446,44 +446,64 @@ def save_outputs(output_dir, condition_stats, finalized, runtime_report,
             )
 
 
-def load_theory_curve(beta):
-    """Load the independently calculated curve; preserve its time convention."""
-    path = Path(__file__).resolve().parent / f"图3理论预测_alpha0.80_beta{beta:.2f}.csv"
+def load_theory_curves():
+    """Load the four theoretical trajectories for each beta panel."""
+    path = Path(__file__).resolve().parent / "图3理论预测_全部α.csv"
     if not path.is_file():
         raise FileNotFoundError(f"Place the matching theory CSV beside fig3.py: {path}")
-    data = np.genfromtxt(path, delimiter=",", names=True, encoding="utf-8-sig")
-    data = np.atleast_1d(data)
-    required = {"MCS", "display_step", "pair_approximation_fc"}
-    if not required.issubset(data.dtype.names or ()):
-        raise ValueError(f"Theory CSV requires columns: {sorted(required)}")
-    times = data["MCS"]
-    steps = data["display_step"]
-    fc = data["pair_approximation_fc"]
-    if (len(data) < 2 or not np.isfinite(np.column_stack((times, steps, fc))).all()
-            or np.any(np.diff(times) <= 0) or np.any((fc < 0) | (fc > 1))
-            or not np.allclose(steps, times + 1)):
+    panel_columns = {
+        beta: [f"pair_approximation_fc_alpha{alpha:.2f}_beta{beta:.2f}"
+               for alpha in ALPHA_VALUES]
+        for beta in BETA_VALUES
+    }
+    required = ["MCS", "display_step"]
+    required.extend(name for names in panel_columns.values() for name in names)
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        header = next(csv.reader(handle), [])
+        missing = set(required) - set(header)
+        if missing:
+            raise ValueError(f"Theory CSV is missing columns: {sorted(missing)}")
+        values = np.loadtxt(handle, delimiter=",", usecols=[header.index(name) for name in required],
+                            ndmin=2)
+    times, steps = values[:, :2].T
+    fc = values[:, 2:]
+    if (len(values) < 2 or not np.isfinite(values).all()
+            or not np.array_equal(times, np.arange(len(times)))
+            or not np.array_equal(steps, times + 1)
+            or np.any((fc < 0) | (fc > 1))):
         raise ValueError("Invalid theory times, display steps, or cooperator fractions.")
-    if times[0] != 0 or times[-1] < MCS_TOTAL:
+    if times[-1] < MCS_TOTAL:
         raise ValueError("Theory CSV must cover initialization through MCS_TOTAL.")
-    keep = (times >= 0) & (times <= MCS_TOTAL)
-    return np.column_stack((steps[keep], fc[keep]))
+    width = len(ALPHA_VALUES)
+    return {
+        beta: np.column_stack((steps[:MCS_TOTAL + 1],
+                               fc[:MCS_TOTAL + 1, i * width:(i + 1) * width]))
+        for i, beta in enumerate(BETA_VALUES)
+    }
 
 
 def plot_results(finalized, output_dir, theory=None):
     from matplotlib.colors import to_rgb
     if theory is None:
-        theory = {beta: load_theory_curve(beta) for beta in BETA_VALUES}
+        theory = load_theory_curves()
     plt.rcParams["font.family"] = "serif"
     plt.rcParams["font.serif"] = ["Times New Roman"]
     plt.rcParams["mathtext.fontset"] = "stix"
 
-    colors = ["#76EE00", "#FFD700", "#4169E1", "#FF0000"]
+    colors = ["#76EE00", "#8E3B96", "#4169E1", "#FF0000"]
+    theory_linestyles = [
+        (0, (5, 2)),                 # alpha = 0.00: dashed
+        (0, (1, 1.5)),               # alpha = 0.50: dotted
+        (0, (5, 2, 1, 2)),           # alpha = 0.80: dash-dot
+        (0, (5, 2, 1, 2, 1, 2)),     # alpha = 1.00: dash-dot-dot
+    ]
     sub_labels = ["(a)", "(b)", "(c)", "(d)"]
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
     axes = axes.flatten()
 
     for panel, beta in enumerate(BETA_VALUES):
         ax = axes[panel]
+        curves = theory[beta]
         ax.set_rasterization_zorder(2)
         for alpha_index, alpha in enumerate(ALPHA_VALUES):
             state = finalized[(panel, alpha_index)]
@@ -516,11 +536,10 @@ def plot_results(finalized, output_dir, theory=None):
                         ecolor=color, elinewidth=0.8, capsize=2.0,
                         zorder=2.5, label="_nolegend_")
 
-        # Independently computed alpha=0.80 theory for this panel's beta.
-        curve = theory[beta]
-        ax.plot(curve[:, 0], curve[:, 1], color="black", linestyle="-",
-                linewidth=1.0, zorder=4,
-                label=r"$\alpha=0.80$ (Theory)")
+            ax.plot(curves[:, 0], curves[:, alpha_index + 1], color=color,
+                    linestyle=theory_linestyles[alpha_index],
+                    linewidth=1.8, zorder=4,
+                    label=rf"$\alpha = {alpha:.2f}$ (Theory)")
 
         ax.set_xscale("log")
         ax.set_xlim(1, MCS_TOTAL + 1)
@@ -543,24 +562,19 @@ def plot_results(finalized, output_dir, theory=None):
                 transform=ax.transAxes, fontsize=14, fontstyle="italic",
                 ha="right", va="bottom")
 
-        # ====================== 修改在这里 ======================
-        handles, labels = ax.get_legend_handles_labels()
-        # Put the theory entry immediately below the matching simulation entry.
-        order = list(range(len(handles) - 1))
-        alpha_index = next(k for k, a in enumerate(ALPHA_VALUES) if np.isclose(a, 0.80))
-        order.insert(alpha_index + 1, len(handles) - 1)
         legend = ax.legend(
-            [handles[k] for k in order], [labels[k] for k in order],
             loc="upper right",
-            bbox_to_anchor=(1.0, 0.90),
+            bbox_to_anchor=(1.0, 0.80),
             frameon=True,
             framealpha=1.0,
             fontsize=12,
-            labelspacing=0.2
+            handlelength=2.6,
+            handletextpad=0.6,
+            labelspacing=0.45,
+            borderpad=0.55,
         )
         legend.get_frame().set_edgecolor("black")
         legend.get_frame().set_linewidth(1.0)
-        # =======================================================
 
     plt.tight_layout()
     plt.subplots_adjust(left=0.08, wspace=0.2, hspace=0.25)
@@ -582,7 +596,7 @@ CLOUD_TIMES = np.unique(np.r_[0, np.geomspace(1, MCS_TOTAL, 180).round().astype(
 
 
 def main():
-    theory = {beta: load_theory_curve(beta) for beta in BETA_VALUES}
+    theory = load_theory_curves()
     # Compile once in the parent so a compilation error fails promptly,
     # rather than repeatedly restarting failed Pool initializer processes.
     if MCS_TOTAL < 2 or NUM_RUNS < 2 or N != L * L:

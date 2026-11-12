@@ -48,7 +48,7 @@ from tqdm import tqdm
 # ==========================================================
 L = 100
 N = L * L
-FIXED_INITIAL_FC = 0.50
+INITIAL_C_PROBABILITY = 0.50
 FIXED_ALPHA = 0.80
 FIXED_BETA = 0.50
 FIXED_GAMMA = 0.10
@@ -143,19 +143,15 @@ def all_edges_agree(strategies, offsets, neighbors):
 
 
 @njit(cache=True)
-def run_single_experiment(initial_fc, noise_k, b, alpha, beta, gamma, epsilon,
+def run_single_experiment(initial_c_probability, noise_k, b, alpha, beta, gamma, epsilon,
                           u, initial_reputation, offsets, neighbors, seed,
                           mcs_total, mcs_transient, early_stop, check_interval):
     np.random.seed(seed)
     population = len(offsets) - 1
-    initial_count = int(np.floor(initial_fc * population + 0.5))
-    strategies = np.zeros(population, dtype=np.int64)
-    initial_positions = np.random.permutation(population)
-    for index in range(initial_count):
-        strategies[initial_positions[index]] = 1
+    strategies = (np.random.random(population) < initial_c_probability).astype(np.int64)
 
     reputations = np.full(population, initial_reputation, dtype=np.float64)
-    actual_initial_fc = initial_count / population
+    actual_initial_fc = np.sum(strategies) / population
     cooperation_sum = 0.0
     sample_count = mcs_total - mcs_transient
 
@@ -202,7 +198,7 @@ def execute_task(task):
     epsilon_index, b_index, run_index, epsilon, b, seed = task
     started = perf_counter()
     result = run_single_experiment(
-        FIXED_INITIAL_FC, FIXED_K, b, FIXED_ALPHA, FIXED_BETA, FIXED_GAMMA,
+        INITIAL_C_PROBABILITY, FIXED_K, b, FIXED_ALPHA, FIXED_BETA, FIXED_GAMMA,
         epsilon, FIXED_U, INITIAL_REPUTATION, _WORKER_OFFSETS,
         _WORKER_NEIGHBORS, seed, MCS_TOTAL, MCS_TRANSIENT,
         EARLY_STOP_ABSORBING, ABSORB_CHECK_INTERVAL,
@@ -324,7 +320,7 @@ def validate_parameters(epsilon_values, b_values):
             or not 0 <= MCS_TRANSIENT < MCS_TOTAL or NUM_RUNS < 1):
         raise ValueError('Invalid MCS or repetition settings.')
     for name, value in (
-            ('initial_fc', FIXED_INITIAL_FC), ('alpha', FIXED_ALPHA),
+            ('initial_c_probability', INITIAL_C_PROBABILITY), ('alpha', FIXED_ALPHA),
             ('beta', FIXED_BETA), ('gamma', FIXED_GAMMA), ('u', FIXED_U),
             ('initial_reputation', INITIAL_REPUTATION),
     ):
@@ -397,7 +393,8 @@ def main():
         f'alpha={FIXED_ALPHA} beta={FIXED_BETA} gamma={FIXED_GAMMA} '
         f'u_reset={FIXED_U} u_flip={FIXED_U / 2} K={FIXED_K}\n'
         f'N={N} L={L} network=periodic_square degree=4 '
-        f'initial_fc={FIXED_INITIAL_FC} initial_reputation={INITIAL_REPUTATION}\n'
+        f'initial_c_probability={INITIAL_C_PROBABILITY} initial_reputation={INITIAL_REPUTATION}\n'
+        'initialization=independent_Bernoulli\n'
         f'epsilon_values={epsilon_values.tolist()} reference_epsilon=0.01\n'
         f'b_values={b_values.tolist()}\n'
         f'MCS_TOTAL={MCS_TOTAL} MCS_TRANSIENT={MCS_TRANSIENT} '
@@ -417,7 +414,7 @@ def main():
     )
 
     print(f'N={N}, alpha={FIXED_ALPHA}, beta={FIXED_BETA}, K={FIXED_K}, '
-          f'f_C(0)={FIXED_INITIAL_FC}')
+          f'initial_C_probability={INITIAL_C_PROBABILITY}')
     print('Epsilon values:', epsilon_values.tolist())
     print(f'{len(epsilon_values)} epsilon values x {len(b_values)} b values '
           f'x {NUM_RUNS} runs = {total_tasks} independent runs')

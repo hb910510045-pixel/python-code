@@ -30,8 +30,8 @@ from tqdm import tqdm
 # ==========================================================
 NETWORK_TYPES = ('square', 'rrg', 'ws', 'moore')
 NETWORK_LABELS = (
-    'Square lattice', 'Random regular', 'WS small-world',
-    'Moore lattice',
+    'von Neumann Square', 'Random regular', 'WS small-world',
+    'Moore Square',
 )
 
 L = 100
@@ -39,7 +39,7 @@ N = L * L
 TARGET_DEGREE = 4
 WS_REWIRE_P = 0.10
 
-FIXED_INITIAL_FC = 0.50
+INITIAL_C_PROBABILITY = 0.50
 FIXED_ALPHA = 0.80
 FIXED_BETA = 0.50
 FIXED_GAMMA = 0.10
@@ -187,18 +187,14 @@ def all_edges_agree(strategies, offsets, neighbors):
 
 
 @njit(cache=True)
-def run_single_experiment(initial_fraction, noise_K, b, alpha, beta, gamma, u,
+def run_single_experiment(initial_c_probability, noise_K, b, alpha, beta, gamma, u,
                           epsilon, initial_reputation, offsets, neighbors, seed,
                           mcs_total, mcs_transient, early_stop, check_interval):
     np.random.seed(seed)
     population = len(offsets) - 1
-    number_of_cooperators = int(np.floor(initial_fraction * population + 0.5))
-    strategies = np.zeros(population, dtype=np.int64)
-    initial_positions = np.random.permutation(population)
-    for index in range(number_of_cooperators):
-        strategies[initial_positions[index]] = 1
+    strategies = (np.random.random(population) < initial_c_probability).astype(np.int64)
     reputations = np.full(population, initial_reputation, dtype=np.float64)
-    initial_cooperation = number_of_cooperators / population
+    initial_cooperation = np.sum(strategies) / population
     cooperation_sum = 0.0
     sample_count = mcs_total - mcs_transient
     cooperation = initial_cooperation
@@ -256,7 +252,7 @@ def execute_task(task):
     graph_seconds = perf_counter() - started
     experiment_started = perf_counter()
     result = run_single_experiment(
-        FIXED_INITIAL_FC, FIXED_K, b, FIXED_ALPHA, FIXED_BETA, FIXED_GAMMA,
+        INITIAL_C_PROBABILITY, FIXED_K, b, FIXED_ALPHA, FIXED_BETA, FIXED_GAMMA,
         FIXED_U, EPSILON, INITIAL_REPUTATION, offsets, neighbors, dynamics_seed,
         MCS_TOTAL, MCS_TRANSIENT, EARLY_STOP_ABSORBING, ABSORB_CHECK_INTERVAL,
     )
@@ -324,7 +320,7 @@ def save_plot(b_values, mean_data, output_dir, file_stem, show):
     axis.tick_params(direction='in', which='both', top=True, right=True, labelsize=14)
     axis.set_xlabel(r'$b$', fontsize=16)
     axis.set_ylabel(r'$f_c$', fontsize=16)
-    axis.legend(fontsize=12, frameon=True, framealpha=1.0,
+    axis.legend(fontsize=10, frameon=True, framealpha=1.0,
                 edgecolor='black', loc='lower left', handlelength=1.5)
     plt.tight_layout()
 
@@ -373,7 +369,7 @@ def validate_parameters(b_values):
     if not (0 <= WS_REWIRE_P <= 1):
         raise ValueError('WS_REWIRE_P必须在[0,1]内。')
     for name, value in (
-        ('initial_fc', FIXED_INITIAL_FC), ('alpha', FIXED_ALPHA),
+        ('initial_c_probability', INITIAL_C_PROBABILITY), ('alpha', FIXED_ALPHA),
         ('gamma', FIXED_GAMMA), ('u', FIXED_U),
         ('initial_reputation', INITIAL_REPUTATION),
     ):
@@ -438,7 +434,7 @@ def main():
     metadata = (
         f'alpha={FIXED_ALPHA} beta={FIXED_BETA} gamma={FIXED_GAMMA} '
         f'u_reset={FIXED_U} u_flip={FIXED_U / 2} K={FIXED_K} epsilon={EPSILON}\n'
-        f'N={N} initial_fc={FIXED_INITIAL_FC} initial_reputation={INITIAL_REPUTATION}\n'
+        f'N={N} initial_c_probability={INITIAL_C_PROBABILITY} initial_reputation={INITIAL_REPUTATION}\n'
         f'MCS_TOTAL={MCS_TOTAL} MCS_TRANSIENT={MCS_TRANSIENT} '
         f'averaging_MCS={MCS_TOTAL - MCS_TRANSIENT} NUM_RUNS={NUM_RUNS}\n'
         f'b_values={b_values.tolist()}\n'
@@ -455,7 +451,7 @@ def main():
         'payoff=accumulated_not_degree_normalized; local_endorsement=neighbors_plus_self; '
         'update=random_with_replacement_per_MCS; global_endorsement=current_configuration_incremental; '
         'reputation_update=synchronous_end_of_MCS\n'
-        'initialization=fixed_count_round_half_up_with_random_positions\n'
+        'initialization=independent_Bernoulli\n'
         f'early_stop_absorbing={EARLY_STOP_ABSORBING} '
         f'all_edges_check_interval={ABSORB_CHECK_INTERVAL}; '
         'early_stop_only_if_u=0; remaining_sampling_window_filled_exactly\n'
@@ -474,7 +470,7 @@ def main():
     )
 
     print(f'N={N}, alpha={FIXED_ALPHA}, beta={FIXED_BETA}, K={FIXED_K}, '
-          f'f_C(0)={FIXED_INITIAL_FC}')
+          f'initial_C_probability={INITIAL_C_PROBABILITY}')
     print('Networks:', ', '.join(NETWORK_LABELS))
     print(f'{len(NETWORK_TYPES)} networks x {len(b_values)} b values x '
           f'{NUM_RUNS} runs = {total_tasks} independent runs')
